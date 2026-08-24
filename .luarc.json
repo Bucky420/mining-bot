@@ -1,0 +1,21 @@
+{
+  "runtime.version": "Lua 5.2",
+  "diagnostics.globals": [
+    "colors",
+    "fs",
+    "gps",
+    "keys",
+    "parallel",
+    "peripheral",
+    "printError",
+    "read",
+    "rednet",
+    "settings",
+    "shell",
+    "sleep",
+    "term",
+    "textutils",
+    "turtle",
+    "write"
+  ]
+}

@@ -1,0 +1,22 @@
+return {
+    files = {
+        { source = "worker.lua", path = "worker.lua" },
+        { source = "config.lua", path = "config.lua" },
+        { source = "lib_util.lua", path = "lib/util.lua" },
+        { source = "lib_state.lua", path = "lib/state.lua" },
+        { source = "lib_inventory.lua", path = "lib/inventory.lua" },
+        { source = "lib_nav.lua", path = "lib/nav.lua" },
+        { source = "lib_map.lua", path = "lib/map.lua" },
+        { source = "lib_markers.lua", path = "lib/markers.lua" },
+        { source = "lib_network.lua", path = "lib/network.lua" },
+        { source = "lib_jobs.lua", path = "lib/jobs.lua" },
+        { source = "lib_scanner.lua", path = "lib/scanner.lua" },
+        { source = "lib_station.lua", path = "lib/station.lua" },
+        { source = "jobs_travel.lua", path = "jobs/travel.lua" },
+        { source = "jobs_dig_tunnel.lua", path = "jobs/dig_tunnel.lua" },
+        { source = "jobs_repair_marker.lua", path = "jobs/repair_marker.lua" },
+        { source = "jobs_survey_area.lua", path = "jobs/survey_area.lua" },
+        { source = "jobs_farm_crop.lua", path = "jobs/farm_crop.lua" },
+        { source = "jobs_configure_site.lua", path = "jobs/configure_site.lua" },
+    },
+}
