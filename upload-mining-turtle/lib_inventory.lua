@@ -19,8 +19,52 @@ local function roleForItem(itemName)
     for _, role in ipairs({ "modem", "pickaxe", "geoScanner", "farmingTool", "chunkLoader" }) do
         if util.contains(equipmentNames(role), itemName) then return role end
     end
-    if itemName:lower():match("hoe$") then return "farmingTool" end
     return "other"
+end
+
+inventory.roleForItem = roleForItem
+
+function inventory.listItemsDetailed()
+    local items = {}
+    for slot = 1, 16 do
+        local ok, detail = pcall(turtle.getItemDetail, slot, true)
+        if ok and type(detail) == "table" and type(detail.name) == "string" then
+            items[#items + 1] = {
+                slot = slot,
+                name = detail.name,
+                count = tonumber(detail.count) or 0,
+                tags = type(detail.tags) == "table" and detail.tags or {},
+            }
+        end
+    end
+    return items
+end
+
+function inventory.itemHasAnyTag(detail, tags)
+    if type(detail) ~= "table" or type(detail.tags) ~= "table" then return false end
+    if type(tags) ~= "table" then return false end
+    for tag, wanted in pairs(tags) do
+        local tagName = type(tag) == "number" and wanted or tag
+        if type(tagName) == "string" and detail.tags[tagName] then return true end
+    end
+    return false
+end
+
+function inventory.findItemByPredicate(predicate)
+    if type(predicate) ~= "function" then return nil end
+    for _, detail in ipairs(inventory.listItemsDetailed()) do
+        if predicate(detail) then return detail.slot, detail end
+    end
+    return nil
+end
+
+function inventory.countMatching(predicate)
+    if type(predicate) ~= "function" then return 0 end
+    local total = 0
+    for _, detail in ipairs(inventory.listItemsDetailed()) do
+        if predicate(detail) then total = total + detail.count end
+    end
+    return total
 end
 
 function inventory.findItem(names)
@@ -73,6 +117,24 @@ function inventory.reconcile()
         end
     end
     if changed then state.save() end
+    local chunkEquipped = inventory.isEquipped("chunkLoader")
+    local chunkSlot = inventory.findItem(equipmentNames("chunkLoader"))
+    if not chunkEquipped and chunkSlot then
+        local recoverySide
+        for _, side in ipairs({ "left", "right" }) do
+            local detail = equippedDetail(side)
+            local role = detail and roleForItem(detail.name) or nil
+            if role == "geoScanner" or role == "pickaxe" or role == "farmingTool" then
+                recoverySide = side
+                break
+            end
+            if not detail then recoverySide = recoverySide or side end
+        end
+        if recoverySide then
+            local restored, restoreError = inventory.equip("chunkLoader", recoverySide)
+            if not restored then return false, "CHUNK_LOADER_RESTORE_FAILED: " .. tostring(restoreError) end
+        end
+    end
     return true
 end
 
@@ -92,17 +154,30 @@ local function oppositeSide(side)
 end
 
 local function sideFor(role)
+    if role == "chunkLoader" then
+        for _, toolRole in ipairs({ "geoScanner", "pickaxe", "farmingTool" }) do
+            local equipped, toolSide = inventory.isEquipped(toolRole)
+            if equipped then return toolSide end
+        end
+        for _, side in ipairs({ "left", "right" }) do
+            local detail = equippedDetail(side)
+            if not detail then return side end
+        end
+        return config.equipment.preferredSide
+    end
     if role ~= "chunkLoader" then
         local chunkLoaded, chunkSide = inventory.isEquipped("chunkLoader")
         if chunkLoaded then return oppositeSide(chunkSide) end
     end
     if role ~= "modem" then
         local modemEquipped, modemSide = inventory.isEquipped("modem")
-        if modemEquipped then return oppositeSide(modemSide) end
+        -- Scanners and tools are temporary. Replace the modem and preserve the
+        -- other upgrade even if a mod reports an unexpected chunk-loader ID.
+        if modemEquipped then return modemSide end
     else
         for _, toolRole in ipairs({ "farmingTool", "pickaxe", "geoScanner" }) do
             local equipped, toolSide = inventory.isEquipped(toolRole)
-            if equipped then return oppositeSide(toolSide) end
+            if equipped then return toolSide end
         end
     end
     return config.equipment.preferredSide
@@ -116,9 +191,12 @@ function inventory.equip(role, side)
 
     local targetEquipment, targetError = equippedDetail(side)
     if targetError then return false, targetError end
-    if role ~= "chunkLoader" and targetEquipment
-        and roleForItem(targetEquipment.name) == "chunkLoader" then
+    local targetRole = targetEquipment and roleForItem(targetEquipment.name) or nil
+    if role ~= "chunkLoader" and targetRole == "chunkLoader" then
         return false, "CHUNK_LOADER_SIDE_PROTECTED"
+    end
+    if targetRole == "other" then
+        return false, "UNKNOWN_EQUIPMENT_SIDE_PROTECTED: " .. tostring(targetEquipment.name)
     end
 
     local data = state.get()
@@ -132,12 +210,6 @@ function inventory.equip(role, side)
     end
 
     local slot = inventory.findItem(equipmentNames(role))
-    if not slot and role == "farmingTool" then
-        for candidate = 1, 16 do
-            local detail = turtle.getItemDetail(candidate)
-            if detail and detail.name:lower():match("hoe$") then slot = candidate break end
-        end
-    end
     if not slot then
         return false, "MISSING_" .. string.upper(role)
     end
@@ -149,7 +221,7 @@ function inventory.equip(role, side)
         role = role,
         slot = slot,
         itemName = selectedDetail and selectedDetail.name or nil,
-        previousRole = data.equipment[side],
+        previousRole = targetRole,
         at = util.now(),
     }
     state.save()
@@ -163,7 +235,7 @@ function inventory.equip(role, side)
         return false, "EQUIP_FAILED: " .. tostring(equipError)
     end
 
-    local oldRole = data.equipment[side]
+    local oldRole = targetRole
     data.equipment[side] = role
     data.pendingEquipmentSwap = nil
     if oldRole then
@@ -212,6 +284,10 @@ end
 
 function inventory.ensureGeoScanner()
     return inventory.equip("geoScanner", sideFor("geoScanner"))
+end
+
+function inventory.ensureChunkLoader()
+    return inventory.equip("chunkLoader", sideFor("chunkLoader"))
 end
 
 function inventory.ensureFarmingTool()

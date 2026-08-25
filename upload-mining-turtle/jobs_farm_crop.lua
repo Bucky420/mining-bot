@@ -1,5 +1,4 @@
 local config = require("config")
-local config = require("config")
 local inventory = require("lib.inventory")
 local map = require("lib.map")
 local nav = require("lib.nav")
@@ -115,12 +114,6 @@ local function ensurePlantingSoilBelow()
     local toolWasEquipped, originalToolSide = inventory.isEquipped("farmingTool")
     local previous = turtle.getSelectedSlot()
     local toolSlot = inventory.findItem(config.equipment.farmingTool)
-    if not toolSlot then
-        for slot = 1, 16 do
-            local item = turtle.getItemDetail(slot)
-            if item and item.name:lower():match("hoe$") then toolSlot = slot break end
-        end
-    end
     local temporaryToolSide
     if not toolSlot and toolWasEquipped then
         toolSlot, temporaryToolSide = inventory.unequip("farmingTool")

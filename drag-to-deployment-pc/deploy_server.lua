@@ -436,6 +436,7 @@ print(("Generic deployment computer ID: %d"):format(os.getComputerID()))
 print("Network: " .. NETWORK_ID)
 print("Watching /projects/<project>/<target>/ for stable changes.")
 
+for _, snapshot in pairs(targets) do announce(snapshot) end
 local scanTimer = os.startTimer(SCAN_SECONDS)
 local announceTimer = os.startTimer(ANNOUNCE_SECONDS)
 while true do

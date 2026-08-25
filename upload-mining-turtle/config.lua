@@ -81,6 +81,8 @@ local config = {
     },
 
     farming = {
+        serviceRadius = 32,
+        serviceIdleSeconds = 5,
         defaultMatureAge = 7,
         seedReserve = 8,
         minimumDiscoveryDensity = 0.6,
@@ -103,7 +105,6 @@ local config = {
             "computercraft:wired_modem_full",
         },
         pickaxe = {
-            "minecraft:netherite_pickaxe",
             "minecraft:diamond_pickaxe",
         },
         geoScanner = {
@@ -113,12 +114,7 @@ local config = {
             "advancedperipherals:chunk_controller",
         },
         farmingTool = {
-            "minecraft:netherite_hoe",
             "minecraft:diamond_hoe",
-            "minecraft:golden_hoe",
-            "minecraft:iron_hoe",
-            "minecraft:stone_hoe",
-            "minecraft:wooden_hoe",
         },
     },
 

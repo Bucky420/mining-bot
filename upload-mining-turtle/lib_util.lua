@@ -79,7 +79,7 @@ function util.readTable(path)
     return value
 end
 
-function util.atomicWriteTable(path, value, preserveBackup)
+function util.atomicWriteTable(path, value)
     ensureParent(path)
     local temporary = path .. ".tmp"
     local backup = path .. ".bak"
@@ -87,14 +87,26 @@ function util.atomicWriteTable(path, value, preserveBackup)
     if fs.exists(temporary) then
         fs.delete(temporary)
     end
+    if fs.exists(previous) then fs.delete(previous) end
+    local primaryValid = util.readTable(path) ~= nil
+    -- A valid primary is itself the recovery copy while the temporary is written.
+    -- If the primary is corrupt, retain the existing backup throughout rotation.
+    if primaryValid and fs.exists(backup) then fs.delete(backup) end
 
     local handle, openError = fs.open(temporary, "w")
     if not handle then
         return false, openError or "unable to open temporary file"
     end
-    handle.write(textutils.serialize(util.detachedCopy(value), { compact = true }))
-    handle.flush()
-    handle.close()
+    local wrote, writeError = pcall(function()
+        handle.write(textutils.serialize(util.detachedCopy(value), { compact = true }))
+        handle.flush()
+        handle.close()
+    end)
+    if not wrote then
+        pcall(handle.close)
+        if fs.exists(temporary) then fs.delete(temporary) end
+        return false, "temporary save failed: " .. tostring(writeError)
+    end
 
     local check, checkError = util.readTable(temporary)
     if not check then
@@ -102,28 +114,23 @@ function util.atomicWriteTable(path, value, preserveBackup)
         return false, "temporary save validation failed: " .. tostring(checkError)
     end
 
-    if fs.exists(previous) then
-        fs.delete(previous)
+    local rotated, rotateError = pcall(function()
+        if fs.exists(path) then
+            if primaryValid then fs.move(path, backup)
+            else fs.delete(path) end
+        end
+        fs.move(temporary, path)
+    end)
+    if not rotated then
+        if not fs.exists(path) and fs.exists(backup) then pcall(fs.move, backup, path) end
+        return false, "save rotation failed: " .. tostring(rotateError)
     end
-    if fs.exists(path) then
-        fs.copy(path, previous)
-        fs.delete(path)
-    end
-    fs.move(temporary, path)
 
     local installed, installedError = util.readTable(path)
     if not installed then
         return false, "installed save validation failed: " .. tostring(installedError)
     end
 
-    if not preserveBackup and fs.exists(previous) then
-        local validPrevious = util.readTable(previous)
-        if validPrevious then
-            if fs.exists(backup) then fs.delete(backup) end
-            fs.move(previous, backup)
-        end
-    end
-    if fs.exists(previous) then fs.delete(previous) end
     return true
 end
 

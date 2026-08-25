@@ -64,6 +64,28 @@ local function openModems()
     return true
 end
 
+local function openAttachedModems()
+    if not config.network.enabled then return false, "NETWORK_DISABLED" end
+    local opened = false
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "modem" then
+            if not rednet.isOpen(name) then rednet.open(name) end
+            opened = true
+        end
+    end
+    if not opened then return false, "NO_MODEM_PERIPHERAL" end
+    return true
+end
+
+local function installedRelease()
+    if not fs.exists("/data/deployment.state") then return nil end
+    local handle = fs.open("/data/deployment.state", "r")
+    if not handle then return nil end
+    local deployment = textutils.unserialize(handle.readAll())
+    handle.close()
+    return type(deployment) == "table" and deployment.release or nil
+end
+
 function network.open()
     return openModems()
 end
@@ -79,6 +101,10 @@ function network.report(eventType, payload)
         messageId = ("report-%d-%d-%d"):format(os.getComputerID(), util.now(), sequence),
         turtleId = os.getComputerID(),
         status = state.get().status,
+        position = util.detachedCopy(data.position),
+        heading = data.heading,
+        positionVerifiedAt = data.positionVerifiedAt,
+        release = installedRelease(),
         -- Outbox entries must not share table references with currentJob/lastJob,
         -- because textutils.serialize rejects repeated table identities.
         payload = util.detachedCopy(payload),
@@ -86,13 +112,13 @@ function network.report(eventType, payload)
     }
     table.insert(data.reportOutbox, message)
     state.save()
-    return network.flushReports()
+    return network.flushReports(true)
 end
 
-function network.flushReports()
+function network.flushReports(attachedOnly)
     local controllerId = state.get().controllerId or config.network.controllerId
     if not controllerId then return false, "NO_CONTROLLER_CONFIGURED" end
-    local ok, openError = openModems()
+    local ok, openError = attachedOnly and openAttachedModems() or openModems()
     if not ok then return false, openError end
     local pending = {}
     for _, message in ipairs(state.get().reportOutbox) do table.insert(pending, message) end
@@ -103,11 +129,11 @@ function network.flushReports()
     return #state.get().reportOutbox == 0
 end
 
-function network.announce(resync)
-    local ok, openError = openModems()
+function network.announce(resync, attachedOnly)
+    local ok, openError = attachedOnly and openAttachedModems() or openModems()
     if not ok then return false, openError end
     local data = state.get()
-    network.flushReports()
+    network.flushReports(attachedOnly)
     local message = {
         type = "WORKER_HELLO",
         turtleId = os.getComputerID(),
@@ -115,8 +141,11 @@ function network.announce(resync)
         statusDetail = data.statusDetail,
         position = data.position,
         heading = data.heading,
+        navigationReady = data.navigationReady == true,
+        navigationError = data.navigationError,
         home = data.home,
         label = os.getComputerLabel(),
+        release = installedRelease(),
         sentAt = util.now(),
         resync = resync == true,
     }
@@ -127,8 +156,8 @@ function network.announce(resync)
 end
 
 function network.receiveDeploymentUpdate(timeout)
-    local ok = openModems()
-    if not ok then return false end
+    local opened = openAttachedModems()
+    if not opened then return false end
     local _, message = rednet.receive(config.network.id .. "/deployment/v1", timeout)
     if type(message) ~= "table" or message.type ~= "UPDATE_AVAILABLE"
         or message.project ~= "mining-bot" or message.target ~= "turtle" then
@@ -142,7 +171,7 @@ function network.receiveDeploymentUpdate(timeout)
             handle.close()
         end
     end
-    return type(deployment) ~= "table" or deployment.release ~= message.release
+    return type(deployment) ~= "table" or deployment.release ~= message.release, message.release
 end
 
 function network.needsRelease(release)
@@ -155,41 +184,118 @@ function network.needsRelease(release)
     return type(deployment) ~= "table" or deployment.release ~= release
 end
 
-function network.checkDeploymentUpdate(timeout)
-    local ok = openModems()
-    if not ok then return false end
-    local nonce = tostring(os.getComputerID()) .. ":" .. tostring(util.now())
-    rednet.broadcast({
-        type = "DISCOVER",
-        project = "mining-bot",
-        target = "turtle",
-        nonce = nonce,
-    }, config.network.id .. "/deployment/v1")
-    local deadline = util.now() + math.floor((timeout or 1) * 1000)
+local function receiveControllerMessage(controllerId, deadline)
     while util.now() < deadline do
-        local _, message = rednet.receive(
-            config.network.id .. "/deployment/v1",
+        local sender, message = rednet.receive(
+            config.network.protocol,
             math.max(0, (deadline - util.now()) / 1000)
         )
-        if type(message) == "table" and message.type == "OFFER"
-            and message.nonce == nonce and message.project == "mining-bot"
-            and message.target == "turtle" then
-            local deployment
-            if fs.exists("/data/deployment.state") then
-                local handle = fs.open("/data/deployment.state", "r")
-                if handle then
-                    deployment = textutils.unserialize(handle.readAll())
-                    handle.close()
-                end
-            end
-            return type(deployment) ~= "table" or deployment.release ~= message.release
+        if sender == controllerId and type(message) == "table" then return message end
+        if sender and type(message) == "table" then
+            deferredMessages[#deferredMessages + 1] = { sender = sender, message = message }
         end
     end
-    return false
+    return nil
 end
 
-function network.receiveJob(timeout)
-    local ok = openModems()
+function network.requestFarmRoute(farmId, start, target, heading, minRevision)
+    local opened, openError = openAttachedModems()
+    if not opened then return nil, openError end
+    local data = state.get()
+    local controllerId = data.controllerId or config.network.controllerId
+    if not controllerId then return nil, "NO_CONTROLLER_CONFIGURED" end
+    local requestId = util.makeId("farm-route")
+    for _ = 1, 3 do
+        rednet.send(controllerId, {
+            type = "FARM_ROUTE_REQUEST", requestId = requestId, farmId = farmId,
+            start = util.detachedCopy(start), target = util.detachedCopy(target), heading = heading,
+            minRevision = minRevision,
+        }, config.network.protocol)
+        local deadline = util.now() + 3000
+        while util.now() < deadline do
+            local message = receiveControllerMessage(controllerId, deadline)
+            if not message then break end
+            if message.type == "FARM_ROUTE_RESPONSE" and message.requestId == requestId then
+                if not message.ok then return nil, message.error or "CONTROLLER_ROUTE_REJECTED" end
+                if type(message.path) ~= "table" or #message.path > 256 then
+                    return nil, "INVALID_CONTROLLER_ROUTE"
+                end
+                local previous = start
+                for _, point in ipairs(message.path) do
+                    if type(point) ~= "table" or type(point.x) ~= "number" or type(point.z) ~= "number"
+                        or point.x ~= math.floor(point.x) or point.z ~= math.floor(point.z)
+                        or math.abs(point.x - previous.x) + math.abs(point.z - previous.z) ~= 1 then
+                        return nil, "INVALID_CONTROLLER_ROUTE"
+                    end
+                    previous = point
+                end
+                if previous.x ~= target.x or previous.z ~= target.z then
+                    return nil, "INCOMPLETE_CONTROLLER_ROUTE"
+                end
+                return message.path, nil, message.mapRevision
+            end
+            deferredMessages[#deferredMessages + 1] = { sender = controllerId, message = message }
+        end
+    end
+    return nil, "CONTROLLER_ROUTE_TIMEOUT"
+end
+
+function network.requestFarmTerrain(farmId, minRevision)
+    local opened, openError = openAttachedModems()
+    if not opened then return nil, openError end
+    local data = state.get()
+    local controllerId = data.controllerId or config.network.controllerId
+    if not controllerId then return nil, "NO_CONTROLLER_CONFIGURED" end
+    local requestId = util.makeId("farm-terrain")
+    for _ = 1, 3 do
+        rednet.send(controllerId, {
+            type = "FARM_TERRAIN_REQUEST", requestId = requestId, farmId = farmId,
+            minRevision = minRevision,
+        }, config.network.protocol)
+        local deadline, metadata, chunks = util.now() + 10000, nil, {}
+        while util.now() < deadline do
+            local message = receiveControllerMessage(controllerId, deadline)
+            if not message then break end
+            if message.requestId ~= requestId then
+                deferredMessages[#deferredMessages + 1] = { sender = controllerId, message = message }
+            elseif message.type == "FARM_TERRAIN_RESPONSE" and not message.ok then
+                return nil, message.error or "CONTROLLER_TERRAIN_REJECTED"
+            elseif message.type == "FARM_TERRAIN_BEGIN" then
+                if type(message.chunkCount) ~= "number" or message.chunkCount < 1
+                    or message.chunkCount > 512 or type(message.cellCount) ~= "number"
+                    or message.cellCount < 0 or message.cellCount > 16384 then
+                    return nil, "INVALID_TERRAIN_HEADER"
+                end
+                metadata = message
+            elseif metadata and message.type == "FARM_TERRAIN_CHUNK"
+                and message.chunkCount == metadata.chunkCount
+                and type(message.chunkIndex) == "number" and message.chunkIndex >= 1
+                and message.chunkIndex <= metadata.chunkCount and type(message.cells) == "table"
+                and #message.cells <= 32 then
+                chunks[message.chunkIndex] = util.detachedCopy(message.cells)
+            elseif metadata and message.type == "FARM_TERRAIN_END"
+                and message.chunkCount == metadata.chunkCount and message.revision == metadata.revision then
+                local cells = {}
+                for index = 1, metadata.chunkCount do
+                    if not chunks[index] then cells = nil break end
+                    for _, cell in ipairs(chunks[index]) do
+                        if type(cell) ~= "table" or type(cell.x) ~= "number"
+                            or type(cell.y) ~= "number" or type(cell.z) ~= "number" then
+                            return nil, "INVALID_TERRAIN_CELL"
+                        end
+                        cells[#cells + 1] = cell
+                    end
+                end
+                if cells and #cells == metadata.cellCount then return cells, nil, metadata.revision end
+                break
+            end
+        end
+    end
+    return nil, "CONTROLLER_TERRAIN_TIMEOUT"
+end
+
+function network.receiveJob(timeout, attachedOnly)
+    local ok = attachedOnly and openAttachedModems() or openModems()
     if not ok then return nil end
     local sender, message
     if #deferredMessages > 0 then
@@ -202,6 +308,10 @@ function network.receiveJob(timeout)
         return nil
     end
     if message.type == "CONTROLLER_HELLO" then
+        if message.controllerId ~= sender or type(message.bootId) ~= "string"
+            or type(message.heartbeatNonce) ~= "string" then
+            return nil, "INVALID_CONTROLLER_HELLO"
+        end
         local data = state.get()
         if data.controllerId and sender ~= data.controllerId then
             return nil, "UNAUTHORIZED_CONTROLLER"
@@ -209,9 +319,9 @@ function network.receiveJob(timeout)
         local changed = data.controllerId ~= sender or data.controllerBootId ~= message.bootId
         data.controllerId = sender
         data.controllerBootId = message.bootId
-        state.save()
         if changed then
-            network.announce(true)
+            state.save()
+            network.announce(true, attachedOnly)
             local failedJob = data.currentJob and data.currentJob.status == "FAILED"
             if actionableStatuses[data.status] or failedJob or data.lastError then
                 network.report("WORKER_STATUS", {
@@ -221,6 +331,23 @@ function network.receiveJob(timeout)
                 })
             end
         end
+        rednet.send(sender, {
+            type = "WORKER_HEARTBEAT",
+            turtleId = os.getComputerID(),
+            controllerBootId = message.bootId,
+            heartbeatNonce = message.heartbeatNonce,
+            status = data.status,
+            position = util.detachedCopy(data.position),
+            heading = data.heading,
+            positionVerifiedAt = data.positionVerifiedAt,
+            navigationReady = data.navigationReady == true,
+            release = installedRelease(),
+            sentAt = util.now(),
+        }, config.network.protocol)
+        return nil
+    end
+    if message.type == "REGISTRATION_REQUIRED" then
+        network.announce(true, attachedOnly)
         return nil
     end
     local controllerId = state.get().controllerId or config.network.controllerId
@@ -231,8 +358,10 @@ function network.receiveJob(timeout)
         and (message.action == "retry" or message.action == "cancel"
             or message.action == "retry_on" or message.action == "retry_off"
             or message.action == "retry_status" or message.action == "retry_toggle"
-            or message.action == "update") then
-        return nil, nil, sender, message.action, message.release
+            or message.action == "update" or message.action == "farm_status"
+            or message.action == "farm_expand" or message.action == "farm_radius"
+            or message.action == "farm_cancel") then
+        return nil, nil, sender, message.action, message.release, message.parameters
     end
     if message.type ~= "ASSIGN_JOB" then return nil end
     if type(message.job) ~= "table" or type(message.job.type) ~= "string" then

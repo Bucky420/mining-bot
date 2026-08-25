@@ -81,6 +81,10 @@ function station.verifyOutputAt(output, protectedItems, options, minimumSlots)
     if not wrapped or type(wrapped.list) ~= "function" or type(wrapped.size) ~= "function" then
         return nil, "OUTPUT_CHEST_NOT_AN_INVENTORY"
     end
+    if options and options.validateFront then
+        local valid, validationError = options.validateFront()
+        if not valid then return nil, validationError or "OUTPUT_CHEST_CHANGED" end
+    end
     if not hasOutputCapacity(wrapped, protectedItems, minimumSlots) then
         return nil, "OUTPUT_CHEST_CAPACITY_LOW"
     end

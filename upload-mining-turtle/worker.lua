@@ -69,22 +69,16 @@ jobs.register("DIG_TUNNEL", require("jobs.dig_tunnel"))
 jobs.register("REPAIR_MARKER", require("jobs.repair_marker"))
 jobs.register("SURVEY_AREA", require("jobs.survey_area"))
 jobs.register("FARM_CROP", require("jobs.farm_crop"))
+jobs.register("FARM_SERVICE", require("jobs.farm_service"))
 jobs.register("CONFIGURE_SITE", require("jobs.configure_site"))
-
-local lastDeploymentCheck = 0
-jobs.setCheckpointHook(function()
-    if util.now() - lastDeploymentCheck < 5000 then return false end
-    lastDeploymentCheck = util.now()
-    local updateAvailable, updateError = inventory.withModem(function()
-        return network.checkDeploymentUpdate(0.75)
-    end)
-    if updateAvailable == false and updateError then return nil, updateError end
-    return updateAvailable == true
-end)
 
 local arguments = { ... }
 local jobExecuting = false
 local navigationReady = false
+local navigationError
+local idlePromptVisible = false
+local rejectedJobIds = {}
+local rejectedJobOrder = {}
 local attemptNavigation
 local validDirections = { north = true, east = true, south = true, west = true }
 
@@ -95,6 +89,8 @@ local function usage()
     print("  repair <x> <y> <z> <JUNCTION|END|BUILD|PROFILE_CHANGE>")
     print("  survey [radius] [exact-block-name]")
     print("  farm <farm-id> [mature-age] [seed-name]")
+    print("  farm-service start [radius] | stop | status")
+    print("  farm-expand [on|off|toggle] | farm-radius <radius>")
     print("  tunnel <tunnel-id> <length>")
     print("  setup station <id> <supply-direction> <output-direction>")
     print("  setup farm <id> <width> <length> <direction> <crop> <seed> [mature-age] <station-id>")
@@ -116,7 +112,9 @@ local function onboarding()
         tostring(fuel)
     ))
     if not navigationReady then
-        print("Navigation setup is incomplete: " .. tostring(data.statusDetail or "unknown reason"))
+        print("Navigation setup is incomplete: " .. tostring(
+            navigationError or data.navigationError or data.statusDetail or "unknown reason"
+        ))
         print("Add/select fuel and run 'refuel all' if needed, clear one horizontal path, then type 'setup'.")
         print("Available now: setup | fuel | status | help | quit")
     elseif map.getRevision() == 0 then
@@ -141,6 +139,64 @@ local function assign(jobType, parameters)
     local ok, assignError = jobs.assign(job)
     if not ok then printError(assignError) return false end
     return true
+end
+
+local function applyFarmControl(action, parameters)
+    local data = state.get()
+    local job = data.currentJob
+    parameters = parameters or {}
+    if action == "farm_status" then
+        if parameters.jobId and job and parameters.jobId ~= job.id then
+            return false, "STALE_FARM_CONTROL"
+        end
+        local target = job and job.type == "FARM_SERVICE" and job or data.lastJob
+        if not target or target.type ~= "FARM_SERVICE" then return false, "NO_FARM_SERVICE" end
+        return true, textutils.serialize(util.detachedCopy({
+            id = target.id,
+            status = target.status,
+            phase = target.progress and target.progress.phase,
+            radius = target.progress and target.progress.radius or target.parameters and target.parameters.radius,
+            autoExpand = target.progress and target.progress.autoExpand,
+            cycle = target.progress and target.progress.cycle,
+            summary = target.progress and target.progress.planSummary,
+            alerts = target.progress and target.progress.alerts,
+        }))
+    end
+    if not job or job.type ~= "FARM_SERVICE" then return false, "NO_ACTIVE_FARM_SERVICE" end
+    if parameters.jobId and parameters.jobId ~= job.id then return false, "STALE_FARM_CONTROL" end
+    if action == "farm_cancel" then return jobs.cancelCurrent() end
+    if action == "farm_expand" then
+        local enabled = parameters.autoExpand
+        if enabled == nil then enabled = not (job.progress.autoExpand ~= false) end
+        job.parameters.autoExpand = enabled
+        job.progress.autoExpand = enabled
+        if job.progress.farm then job.progress.farm.autoExpand = enabled end
+        if enabled then job.progress.forceSurvey = true end
+        if job.progress.farm then
+            local saved, saveError = map.addNode(job.progress.farm)
+            if not saved then return false, "FARM_MAP_SAVE_FAILED: " .. tostring(saveError) end
+        end
+        state.save()
+        return true, enabled and "enabled" or "disabled"
+    end
+    if action == "farm_radius" then
+        local radius = tonumber(parameters.radius)
+        if not radius or radius ~= math.floor(radius) or radius < 1 or radius > 32 then
+            return false, "FARM_RADIUS_MUST_BE_1_TO_32"
+        end
+        job.parameters.radius = radius
+        job.progress.radius = radius
+        if job.progress.farm then job.progress.farm.radius = radius end
+        job.progress.surveyComplete = false
+        job.progress.forceSurvey = true
+        if job.progress.farm then
+            local saved, saveError = map.addNode(job.progress.farm)
+            if not saved then return false, "FARM_MAP_SAVE_FAILED: " .. tostring(saveError) end
+        end
+        state.save()
+        return true, tostring(radius)
+    end
+    return false, "UNKNOWN_FARM_CONTROL"
 end
 
 local function printStatus()
@@ -225,7 +281,9 @@ local function handle(tokens)
         return true
     end
     if not navigationReady and (command == "travel" or command == "dig" or command == "repair"
-        or command == "survey" or command == "farm" or command == "tunnel" or command == "setup") then
+        or command == "survey" or command == "farm" or command == "farm-service"
+        or command == "farm-expand" or command == "farm-radius"
+        or command == "tunnel" or command == "setup") then
         printError("Navigation is not ready. Fix the reported problem and type 'setup'.")
         return true
     end
@@ -280,6 +338,42 @@ local function handle(tokens)
             if not tokens[3] or age then
                 assign("FARM_CROP", { farmId = tokens[2], matureAge = age, seed = tokens[4] })
             end
+        end
+        return true
+    end
+    if command == "farm-service" then
+        local operation = string.lower(tokens[2] or "status")
+        if operation == "start" then
+            local radius = tokens[3] and integer(tokens[3], "radius") or config.farming.serviceRadius
+            if radius and radius >= 1 and radius <= 32 then
+                assign("FARM_SERVICE", { radius = radius, autoExpand = true })
+            elseif radius then printError("farm service radius must be 1 to 32") end
+        elseif operation == "stop" then
+            local ok, controlError = applyFarmControl("farm_cancel")
+            if not ok then printError(controlError) end
+        elseif operation == "status" then
+            local ok, detail = applyFarmControl("farm_status")
+            if ok then print(detail) else printError(detail) end
+        else printError("farm-service start [radius] | stop | status") end
+        return true
+    end
+    if command == "farm-expand" then
+        local value = string.lower(tokens[2] or "toggle")
+        if value ~= "on" and value ~= "off" and value ~= "toggle" then
+            printError("farm-expand [on|off|toggle]")
+        else
+            local parameters = {}
+            if value ~= "toggle" then parameters.autoExpand = value == "on" end
+            local ok, detail = applyFarmControl("farm_expand", parameters)
+            if ok then print("Automatic farm expansion " .. detail) else printError(detail) end
+        end
+        return true
+    end
+    if command == "farm-radius" then
+        local radius = integer(tokens[2], "radius")
+        if radius then
+            local ok, detail = applyFarmControl("farm_radius", { radius = radius })
+            if ok then print("Farm radius set to " .. detail) else printError(detail) end
         end
         return true
     end
@@ -419,30 +513,44 @@ local function waitForAssignment()
     local remoteJob
     local remoteControl
     local remoteControlRelease
+    local remoteControlParameters
     local controllerSender
     local updateRequested = false
     network.announce()
     parallel.waitForAny(
         function()
-            write("worker> ")
+            if not idlePromptVisible then
+                write("worker> ")
+                idlePromptVisible = true
+            end
             line = read()
+            idlePromptVisible = false
         end,
         function()
             while not remoteJob and not remoteControl do
-                local received, _, sender, control, controlRelease = network.receiveJob(1)
+                local received, _, sender, control, controlRelease, controlParameters = network.receiveJob(1)
                 if received then remoteJob, controllerSender = received, sender
                 elseif control then
-                    remoteControl, remoteControlRelease, controllerSender = control, controlRelease, sender
+                    remoteControl, remoteControlRelease, remoteControlParameters, controllerSender =
+                        control, controlRelease, controlParameters, sender
                 else sleep(0.25) end
             end
         end,
         function()
             while not updateRequested do
-                updateRequested = network.receiveDeploymentUpdate(1)
-                if not updateRequested then
-                    updateRequested = network.checkDeploymentUpdate(0.75)
-                end
+                local release
+                updateRequested, release = network.receiveDeploymentUpdate(1)
+                if updateRequested then os.queueEvent("bucky_deployment_update_ack", release) end
                 if not updateRequested then sleep(0.25) end
+            end
+        end,
+        function()
+            while not updateRequested do
+                local _, release = os.pullEvent("bucky_deployment_update")
+                if network.needsRelease(release) then
+                    os.queueEvent("bucky_deployment_update_ack", release)
+                    updateRequested = true
+                end
             end
         end,
         function()
@@ -489,23 +597,46 @@ local function waitForAssignment()
                     elseif remoteControl == "retry_status" then
                         ok = true
                         controlError = state.get().autoRetry and "enabled" or "disabled"
+                    elseif remoteControl == "farm_status" or remoteControl == "farm_expand"
+                        or remoteControl == "farm_radius" or remoteControl == "farm_cancel" then
+                        ok, controlError = applyFarmControl(remoteControl, remoteControlParameters)
                     else ok, controlError = jobs.cancelCurrent() end
         network.report(ok and "CONTROL_ACCEPTED" or "CONTROL_REJECTED", {
             action = remoteControl,
             reason = controlError,
             job = state.get().currentJob or state.get().lastJob,
         })
-        if not ok then printError("Remote " .. remoteControl .. " failed: " .. tostring(controlError)) end
+        if not ok then
+            if idlePromptVisible then print("") idlePromptVisible = false end
+            printError("Remote " .. remoteControl .. " failed: " .. tostring(controlError))
+        end
         return true
     end
     if remoteJob then
         state.get().controllerId = controllerSender
         state.save()
         if not navigationReady then
-            printError("Rejected network job: NAVIGATION_NOT_READY")
-            network.report("JOB_REJECTED", { reason = "NAVIGATION_NOT_READY", job = remoteJob })
+            local rejectedKey = remoteJob.id or (tostring(remoteJob.type) .. ":missing-id")
+            if rejectedJobIds[rejectedKey] then return true end
+            rejectedJobIds[rejectedKey] = true
+            rejectedJobOrder[#rejectedJobOrder + 1] = rejectedKey
+            while #rejectedJobOrder > 32 do
+                rejectedJobIds[table.remove(rejectedJobOrder, 1)] = nil
+            end
+            if idlePromptVisible then print("") idlePromptVisible = false end
+            local reason = "NAVIGATION_NOT_READY: " .. tostring(
+                navigationError or state.get().navigationError or state.get().statusDetail or "unknown calibration failure"
+            )
+            printError("Rejected network job: " .. reason)
+            network.report("JOB_REJECTED", {
+                reason = reason,
+                detail = navigationError,
+                lastError = state.get().lastError,
+                job = remoteJob,
+            })
             return true
         end
+        if idlePromptVisible then print("") idlePromptVisible = false end
         local ok, assignError = jobs.assign(remoteJob)
         if not ok then
             printError("Rejected network job: " .. tostring(assignError))
@@ -518,7 +649,7 @@ local function waitForAssignment()
     return handle(tokenize(line))
 end
 
-local function runActiveJob()
+local function runActiveJob(suppressInput)
     local success, result
     local updateRequested = false
     jobExecuting = true
@@ -529,6 +660,10 @@ local function runActiveJob()
             os.queueEvent("mining_job_finished")
         end,
         function()
+            if suppressInput then
+                os.pullEvent("mining_job_finished")
+                return
+            end
             while jobExecuting do
                 local line
                 parallel.waitForAny(
@@ -543,7 +678,9 @@ local function runActiveJob()
                 if line then
                     local tokens = tokenize(line)
                     local command = string.lower(tokens[1] or "")
-                    if command == "cancel" or command == "status" or command == "tasks" then
+                    if command == "cancel" or command == "status" or command == "tasks"
+                        or command == "farm-expand" or command == "farm-radius"
+                        or command == "farm-service" then
                         handle(tokens)
                     elseif command ~= "" then
                         printError("Only status, tasks, or cancel is available while a job is active")
@@ -563,7 +700,7 @@ local function runActiveJob()
         end,
         function()
             while jobExecuting do
-                local remoteJob, receiveError, sender, control, controlRelease = network.receiveJob(0.5)
+                local remoteJob, receiveError, sender, control, controlRelease, controlParameters = network.receiveJob(0.5, true)
                 if control then
                     state.get().controllerId = sender
                     state.save()
@@ -578,6 +715,9 @@ local function runActiveJob()
                             reportControl = false
                         end
                     elseif control == "cancel" then ok, controlError = jobs.cancelCurrent()
+                    elseif control == "farm_status" or control == "farm_expand"
+                        or control == "farm_radius" or control == "farm_cancel" then
+                        ok, controlError = applyFarmControl(control, controlParameters)
                     else ok, controlError = false, "JOB_IS_RUNNING" end
                     if reportControl then
                         network.report(ok and "CONTROL_ACCEPTED" or "CONTROL_REJECTED", {
@@ -597,7 +737,9 @@ local function runActiveJob()
         end,
         function()
             while jobExecuting and not updateRequested do
-                if network.receiveDeploymentUpdate(1) then
+                local available, release = network.receiveDeploymentUpdate(1)
+                if available then
+                    os.queueEvent("bucky_deployment_update_ack", release)
                     updateRequested = true
                     local requested, requestError = jobs.requestUpdate()
                     if requested then
@@ -607,6 +749,21 @@ local function runActiveJob()
                     end
                 else
                     sleep(0.25)
+                end
+            end
+        end,
+        function()
+            while jobExecuting and not updateRequested do
+                local _, release = os.pullEvent("bucky_deployment_update")
+                if network.needsRelease(release) then
+                    os.queueEvent("bucky_deployment_update_ack", release)
+                    updateRequested = true
+                    local requested, requestError = jobs.requestUpdate()
+                    if requested then
+                        print("Background updater requested a safe job checkpoint")
+                    elseif requestError ~= "NO_RUNNING_JOB" then
+                        printError("Could not pause for background update: " .. tostring(requestError))
+                    end
                 end
             end
         end
@@ -626,6 +783,10 @@ end
 attemptNavigation = function(allowDisplacement)
     local bootOk, bootError = nav.bootstrap(allowDisplacement)
     navigationReady = bootOk == true
+    navigationError = navigationReady and nil or tostring(bootError)
+    state.get().navigationReady = navigationReady
+    state.get().navigationError = navigationError
+    state.save()
     if navigationReady then
         print(("Navigation ready at %d,%d,%d facing %s"):format(
             nav.getPosition().x, nav.getPosition().y, nav.getPosition().z, nav.getHeading()
@@ -652,12 +813,7 @@ while running do
     end
     if navigationReady and currentJob and currentJob.status ~= "FAILED" then
         local success, result, updateRequested
-        if #arguments > 0 then
-            success, result = jobs.executeCurrent()
-            if result == "JOB_UPDATE_PENDING" then updateRequested = true end
-        else
-            success, result, updateRequested = runActiveJob()
-        end
+        success, result, updateRequested = runActiveJob(#arguments > 0)
         if result == "JOB_UPDATE_PENDING" then updateRequested = true end
         local event = result == "JOB_UPDATE_PENDING" and "WORKER_UPDATING"
             or success and "JOB_COMPLETE"

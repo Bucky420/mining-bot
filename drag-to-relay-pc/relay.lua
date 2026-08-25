@@ -1,4 +1,6 @@
 local NETWORK_ID = tostring(settings.get("bucky.network", "bucky"))
+local arguments = { ... }
+local NATIVE_TABS = arguments[1] == "native"
 local PROTOCOL = NETWORK_ID .. "/deployment/v1"
 local JOB_PROTOCOL = NETWORK_ID .. "/mining/v1"
 local CACHE_ROOT = "/relay-cache"
@@ -15,6 +17,8 @@ local relayState = {
     seenAlertIds = {},
     seenAlertOrder = {},
     alertControllerBootId = nil,
+    farmMaps = {},
+    ui = { zoom = 1, followPlayer = true },
 }
 local pendingCommands = relayState.pendingCommands
 
@@ -110,6 +114,9 @@ local function loadRelayState()
                     if relayState.alertsEnabled == nil then relayState.alertsEnabled = true end
                     relayState.seenAlertIds = relayState.seenAlertIds or {}
                     relayState.seenAlertOrder = relayState.seenAlertOrder or {}
+                    relayState.farmMaps = relayState.farmMaps or {}
+                    relayState.ui = relayState.ui or { zoom = 1, followPlayer = true }
+                    relayState.farmMaps = {}
                     pendingCommands = relayState.pendingCommands
                     return
                 end
@@ -417,8 +424,222 @@ local commandHistory = {}
 local historyIndex
 local historyDraft = ""
 local tabCycle
+local baseTerminal
+local commandWindow
+local activeTab = "command"
+local liveFarmMaps = {}
+local turtleStates = {}
+local mapSnapshots = {}
+local mapDeltas = {}
+local playerPosition
+local mapCenter = { x = 0, z = 0 }
+local mapMessage = "Waiting for map data"
+local gpsTimer
+local viewHeading = "north"
+local previousGpsPosition
+
+local function terminalSize()
+    if baseTerminal then return baseTerminal.getSize() end
+    return term.getSize()
+end
+
+local function mapZoom()
+    local zoom = tonumber(relayState.ui.zoom) or 1
+    return math.max(1, math.min(16, zoom))
+end
+
+local function viewDelta(dx, dz)
+    if viewHeading == "east" then return dz, -dx end
+    if viewHeading == "south" then return -dx, -dz end
+    if viewHeading == "west" then return -dz, dx end
+    return dx, dz
+end
+
+local function worldDelta(screenX, screenY)
+    if viewHeading == "east" then return -screenY, screenX end
+    if viewHeading == "south" then return -screenX, -screenY end
+    if viewHeading == "west" then return screenY, -screenX end
+    return screenX, screenY
+end
+
+local function headingGlyph(heading)
+    local indexes = { north = 0, east = 1, south = 2, west = 3 }
+    local glyphs = { "^", ">", "v", "<" }
+    if indexes[heading] == nil then return "T" end
+    return glyphs[((indexes[heading] - indexes[viewHeading]) % 4) + 1]
+end
+
+local function updatePlayerGps(x, y, z)
+    if previousGpsPosition then
+        local dx, dz = x - previousGpsPosition.x, z - previousGpsPosition.z
+        if math.abs(dx) >= 0.5 or math.abs(dz) >= 0.5 then
+            if math.abs(dx) >= math.abs(dz) then viewHeading = dx >= 0 and "east" or "west"
+            else viewHeading = dz >= 0 and "south" or "north" end
+        end
+    end
+    previousGpsPosition = { x = x, z = z }
+    playerPosition = { x = x, y = y, z = z, at = os.epoch("utc") }
+end
+
+local function terrainStyle(cell)
+    local class = cell.class
+    if cell.occupant then
+        if cell.occupant:find("leaves", 1, true) or cell.occupant:find("log", 1, true) then
+            return "^", colors.green
+        end
+        return "*", colors.lime
+    end
+    if class == "water" then return "~", colors.blue end
+    if class == "grass" then return ",", colors.green end
+    if class == "farmland" then return "=", colors.brown end
+    if class == "dirt" then return ".", colors.brown end
+    if class == "sand" then return ":", colors.yellow end
+    if class == "stone" then return "o", colors.lightGray end
+    if class == "tree_log" or class == "tree_leaves" then return "^", colors.green end
+    if class == "fence" or class == "hard" or class == "unknown" then return "#", colors.gray end
+    return ".", colors.lightGray
+end
+
+local function writeBase(x, y, text, foreground, background)
+    if not baseTerminal then return end
+    baseTerminal.setCursorPos(x, y)
+    if foreground then baseTerminal.setTextColor(foreground) end
+    if background then baseTerminal.setBackgroundColor(background) end
+    baseTerminal.write(text)
+    baseTerminal.setTextColor(colors.white)
+    baseTerminal.setBackgroundColor(colors.black)
+end
+
+local function drawTabHeader()
+    if not baseTerminal then return end
+    local width = terminalSize()
+    baseTerminal.setCursorPos(1, 1)
+    baseTerminal.setBackgroundColor(colors.gray)
+    baseTerminal.setTextColor(colors.white)
+    baseTerminal.clearLine()
+    writeBase(1, 1, " CMD ", colors.white,
+        activeTab == "command" and colors.blue or colors.gray)
+    writeBase(7, 1, " MAP ", colors.white,
+        activeTab == "map" and colors.blue or colors.gray)
+    if activeTab == "map" and width >= 20 then
+        writeBase(width - 10, 1, " - ", colors.white, colors.gray)
+        writeBase(width - 6, 1, " + ", colors.white, colors.gray)
+        writeBase(width - 2, 1, relayState.ui.followPlayer and "F" or "P",
+            relayState.ui.followPlayer and colors.lime or colors.white, colors.gray)
+    end
+end
+
+local function chooseInitialCenter()
+    if relayState.ui.followPlayer and playerPosition then
+        mapCenter.x, mapCenter.z = playerPosition.x, playerPosition.z
+        return
+    end
+    if mapCenter.x ~= 0 or mapCenter.z ~= 0 then return end
+    for _, farmMap in pairs(liveFarmMaps) do
+        local center = farmMap.data and farmMap.data.center
+        if center then mapCenter.x, mapCenter.z = center.x, center.z return end
+    end
+    for _, turtleInfo in pairs(turtleStates) do
+        if turtleInfo.position then
+            mapCenter.x, mapCenter.z = turtleInfo.position.x, turtleInfo.position.z
+            return
+        end
+    end
+end
+
+local function renderMap()
+    if activeTab ~= "map" or not baseTerminal then return end
+    chooseInitialCenter()
+    local width, height = terminalSize()
+    local top, bottom = 2, height - 1
+    local contentHeight = math.max(1, bottom - top + 1)
+    baseTerminal.setBackgroundColor(colors.black)
+    baseTerminal.setTextColor(colors.white)
+    for y = top, height do
+        baseTerminal.setCursorPos(1, y)
+        baseTerminal.clearLine()
+    end
+    local zoom = mapZoom()
+    for _, farmMap in pairs(liveFarmMaps) do
+        for _, cell in pairs(farmMap.data and farmMap.data.cells or {}) do
+            local viewX, viewY = viewDelta(cell.x - mapCenter.x, cell.z - mapCenter.z)
+            local screenX = math.floor(viewX / zoom + width / 2 + 0.5)
+            local screenY = math.floor(viewY / zoom + contentHeight / 2 + top)
+            if screenX >= 1 and screenX <= width and screenY >= top and screenY <= bottom then
+                local glyph, color = terrainStyle(cell)
+                writeBase(screenX, screenY, glyph, color, colors.black)
+            end
+        end
+    end
+    local nearestName, nearestDistance
+    for _, turtleInfo in pairs(turtleStates) do
+        local position = turtleInfo.position
+        if position then
+            local distance = math.floor(math.sqrt(
+                (position.x - mapCenter.x) ^ 2 + (position.z - mapCenter.z) ^ 2
+            ) + 0.5)
+            if not nearestDistance or distance < nearestDistance then
+                nearestName, nearestDistance = turtleInfo.name or ("T" .. tostring(turtleInfo.id)), distance
+            end
+            local viewX, viewY = viewDelta(position.x - mapCenter.x, position.z - mapCenter.z)
+            local rawX = math.floor(viewX / zoom + width / 2 + 0.5)
+            local rawY = math.floor(viewY / zoom + contentHeight / 2 + top)
+            local onScreen = rawX >= 1 and rawX <= width and rawY >= top and rawY <= bottom
+            local screenX = math.max(1, math.min(width, rawX))
+            local screenY = math.max(top, math.min(bottom, rawY))
+            local stale = turtleInfo.lastSeen
+                and os.epoch("utc") - turtleInfo.lastSeen > 60000
+            writeBase(screenX, screenY, onScreen and headingGlyph(turtleInfo.heading) or "!",
+                stale and colors.lightGray or colors.orange, colors.black)
+        end
+    end
+    if playerPosition then
+        local viewX, viewY = viewDelta(playerPosition.x - mapCenter.x, playerPosition.z - mapCenter.z)
+        local screenX = math.floor(viewX / zoom + width / 2 + 0.5)
+        local screenY = math.floor(viewY / zoom + contentHeight / 2 + top)
+        if screenX >= 1 and screenX <= width and screenY >= top and screenY <= bottom then
+            writeBase(screenX, screenY, "@", colors.cyan, colors.black)
+        end
+    end
+    local status = ("%s z%d UP:%s %d,%d"):format(
+        relayState.ui.followPlayer and "FOLLOW" or "PAN", zoom,
+        viewHeading:sub(1, 1):upper(),
+        math.floor(mapCenter.x), math.floor(mapCenter.z)
+    )
+    if nearestName and #status < width then
+        status = status .. (" %s:%d"):format(tostring(nearestName), nearestDistance)
+    end
+    if #status < width then status = status .. " " .. tostring(mapMessage) end
+    writeBase(1, height, status:sub(1, width), colors.white, colors.black)
+    drawTabHeader()
+end
+
+local function switchTab(tab)
+    if tab ~= "command" and tab ~= "map" then return end
+    activeTab = tab
+    promptVisible = false
+    if commandWindow then commandWindow.setVisible(tab == "command") end
+    drawTabHeader()
+    if tab == "map" then renderMap() end
+end
+
+local function setZoom(value)
+    relayState.ui.zoom = math.max(1, math.min(16, value))
+    saveRelayState()
+    renderMap()
+end
+
+local function panMap(dx, dz)
+    relayState.ui.followPlayer = false
+    local step = mapZoom() * 2
+    local worldX, worldZ = worldDelta(dx * step, dz * step)
+    mapCenter.x, mapCenter.z = mapCenter.x + worldX, mapCenter.z + worldZ
+    saveRelayState()
+    renderMap()
+end
 
 local function clearPrompt()
+    if activeTab ~= "command" then return end
     if not promptVisible then return end
     local _, currentY = term.getCursorPos()
     local startY = math.min(promptStartY or currentY, currentY)
@@ -430,6 +651,7 @@ local function clearPrompt()
 end
 
 local function drawPrompt(value)
+    if activeTab ~= "command" then return end
     local _, y = term.getCursorPos()
     promptStartY = y
     write("relay> " .. value)
@@ -440,6 +662,11 @@ local function redrawPrompt()
 end
 
 local function printAsync(value, isError)
+    if activeTab == "map" then
+        mapMessage = tostring(value)
+        renderMap()
+        return
+    end
     clearPrompt()
     if isError then printError(value) else print(value) end
     redrawPrompt()
@@ -475,6 +702,269 @@ local function requestAlertSync()
             controllerBootId = controllerBootId,
         }, JOB_PROTOCOL)
     end
+end
+
+local function requestFarmSnapshot(farmKey)
+    if NATIVE_TABS or not controllerId or not controllerRegistered or type(farmKey) ~= "string" then return end
+    for key, pending in pairs(mapDeltas) do
+        if pending.farmKey == farmKey then mapDeltas[key] = nil end
+    end
+    rednet.send(controllerId, {
+        type = "FARM_MAP_RESYNC_REQUEST", source = os.getComputerID(),
+        controllerBootId = controllerBootId, farmKey = farmKey,
+        haveRevision = liveFarmMaps[farmKey] and liveFarmMaps[farmKey].revision or 0,
+    }, JOB_PROTOCOL)
+end
+
+local function requestFarmIndex(index)
+    local indexed = {}
+    for _, entry in ipairs(index or {}) do
+        if type(entry) == "table" and type(entry.farmKey) == "string" then
+            indexed[entry.farmKey] = true
+            local localMap = liveFarmMaps[entry.farmKey]
+            if not localMap or tonumber(localMap.revision) ~= tonumber(entry.revision) then
+                requestFarmSnapshot(entry.farmKey)
+            end
+        end
+    end
+    for farmKey in pairs(liveFarmMaps) do
+        if not indexed[farmKey] then
+            liveFarmMaps[farmKey] = nil
+            mapSnapshots[farmKey] = nil
+            for key, pending in pairs(mapDeltas) do
+                if pending.farmKey == farmKey then mapDeltas[key] = nil end
+            end
+        end
+    end
+    for farmKey in pairs(mapSnapshots) do
+        if not indexed[farmKey] then mapSnapshots[farmKey] = nil end
+    end
+    for key, pending in pairs(mapDeltas) do
+        if not indexed[pending.farmKey] then mapDeltas[key] = nil end
+    end
+end
+
+local function finiteMapNumber(value)
+    return type(value) == "number" and value == value
+        and value > -math.huge and value < math.huge
+end
+
+local function validMapCell(cell)
+    return type(cell) == "table" and finiteMapNumber(cell.x) and finiteMapNumber(cell.y)
+        and finiteMapNumber(cell.z) and cell.x % 1 == 0 and cell.y % 1 == 0
+        and cell.z % 1 == 0 and type(cell.name) == "string" and #cell.name <= 128
+end
+
+local function safeMapCell(cell)
+    if not validMapCell(cell) then return nil end
+    return {
+        x = cell.x, y = cell.y, z = cell.z, name = cell.name,
+        class = type(cell.class) == "string" and cell.class:sub(1, 128) or nil,
+        occupant = type(cell.occupant) == "string" and cell.occupant:sub(1, 128) or nil,
+    }
+end
+
+local function safeMapMetadata(metadata)
+    metadata = type(metadata) == "table" and metadata or {}
+    local result = {
+        phase = type(metadata.phase) == "string" and metadata.phase or nil,
+        radius = finiteMapNumber(metadata.radius) and metadata.radius or nil,
+        knownColumns = finiteMapNumber(metadata.knownColumns) and metadata.knownColumns or nil,
+        autoExpand = type(metadata.autoExpand) == "boolean" and metadata.autoExpand or nil,
+    }
+    if type(metadata.center) == "table" and finiteMapNumber(metadata.center.x)
+        and finiteMapNumber(metadata.center.y) and finiteMapNumber(metadata.center.z) then
+        result.center = { x = metadata.center.x, y = metadata.center.y, z = metadata.center.z }
+    end
+    return result
+end
+
+local function safeTurtleStates(source)
+    local result, count = {}, 0
+    for id, turtleInfo in pairs(type(source) == "table" and source or {}) do
+        if count >= 128 then break end
+        local position = type(turtleInfo) == "table" and turtleInfo.position
+        local turtleId = type(turtleInfo) == "table" and (turtleInfo.id or id) or nil
+        local validId = finiteMapNumber(turtleId)
+            or type(turtleId) == "string" and #turtleId <= 32
+        if validId and type(position) == "table" and finiteMapNumber(position.x)
+            and finiteMapNumber(position.y) and finiteMapNumber(position.z) then
+            local headings = { north = true, east = true, south = true, west = true }
+            result[turtleId] = {
+                id = turtleId,
+                name = type(turtleInfo.name) == "string" and turtleInfo.name:sub(1, 32) or nil,
+                heading = headings[turtleInfo.heading] and turtleInfo.heading or nil,
+                lastSeen = finiteMapNumber(turtleInfo.lastSeen) and turtleInfo.lastSeen or nil,
+                online = type(turtleInfo.online) == "boolean" and turtleInfo.online or nil,
+                release = type(turtleInfo.release) == "string" and turtleInfo.release:sub(1, 128) or nil,
+                position = { x = position.x, y = position.y, z = position.z },
+            }
+            count = count + 1
+        end
+    end
+    return result
+end
+
+local function cachedCellCount()
+    local count = 0
+    for _, farmMap in pairs(liveFarmMaps) do
+        for _ in pairs(farmMap.data and farmMap.data.cells or {}) do count = count + 1 end
+    end
+    return count
+end
+
+local function prunePendingMaps(collection, maximum)
+    local now, count, oldestKey, oldestAt = os.epoch("utc"), 0
+    local removed = {}
+    for key, pending in pairs(collection) do
+        local createdAt = pending.createdAt or now
+        if now - createdAt > 30000 then
+            collection[key] = nil
+            removed[#removed + 1] = pending.farmKey
+        else
+            count = count + 1
+            if not oldestAt or createdAt < oldestAt then
+                oldestKey, oldestAt = key, createdAt
+            end
+        end
+    end
+    if count >= maximum and oldestKey then
+        removed[#removed + 1] = collection[oldestKey].farmKey
+        collection[oldestKey] = nil
+    end
+    return removed
+end
+
+local function applySnapshotChunk(message)
+    local pending = mapSnapshots[message.farmKey]
+    if not pending or pending.snapshotId ~= message.snapshotId
+        or message.chunkCount ~= pending.chunkCount
+        or type(message.chunkIndex) ~= "number" or message.chunkIndex < 1
+        or message.chunkIndex > pending.chunkCount or type(message.cells) ~= "table"
+        or #message.cells > 32 then return end
+    local cells = {}
+    for _, cell in ipairs(message.cells) do
+        local safeCell = safeMapCell(cell)
+        if safeCell then cells[#cells + 1] = safeCell end
+    end
+    pending.chunks[message.chunkIndex] = cells
+end
+
+local function finishSnapshot(message)
+    local pending = mapSnapshots[message.farmKey]
+    if not pending or pending.snapshotId ~= message.snapshotId then return end
+    if message.chunkCount ~= pending.chunkCount or message.mapRevision ~= pending.revision then
+        mapSnapshots[message.farmKey] = nil
+        requestFarmSnapshot(message.farmKey)
+        return
+    end
+    local cells, receivedCount, uniqueCount = {}, 0, 0
+    for chunkIndex = 1, pending.chunkCount do
+        local chunk = pending.chunks[chunkIndex]
+        if not chunk then
+            mapSnapshots[message.farmKey] = nil
+            requestFarmSnapshot(message.farmKey)
+            return
+        end
+        for _, cell in ipairs(chunk) do
+            local key = ("%d:%d"):format(cell.x, cell.z)
+            receivedCount = receivedCount + 1
+            if not cells[key] then uniqueCount = uniqueCount + 1 end
+            cells[key] = cell
+        end
+    end
+    local replacedCount = 0
+    local replaced = liveFarmMaps[message.farmKey]
+    for _ in pairs(replaced and replaced.data and replaced.data.cells or {}) do replacedCount = replacedCount + 1 end
+    local total = cachedCellCount() - replacedCount + uniqueCount
+    if receivedCount ~= pending.cellCount or uniqueCount ~= pending.cellCount
+        or uniqueCount > 4096 or total > 8192 then
+        mapSnapshots[message.farmKey] = nil
+        mapMessage = "Invalid or oversized map snapshot"
+        return
+    end
+    pending.metadata.cells = cells
+    if not liveFarmMaps[message.farmKey] then
+        local mapCount, oldestKey, oldestAt = 0
+        for farmKey, farmMap in pairs(liveFarmMaps) do
+            mapCount = mapCount + 1
+            if not oldestAt or (farmMap.syncedAt or 0) < oldestAt then
+                oldestKey, oldestAt = farmKey, farmMap.syncedAt or 0
+            end
+        end
+        if mapCount >= 32 and oldestKey then liveFarmMaps[oldestKey] = nil end
+    end
+    liveFarmMaps[message.farmKey] = {
+        revision = pending.revision, data = pending.metadata, syncedAt = os.epoch("utc"),
+    }
+    mapSnapshots[message.farmKey] = nil
+    mapMessage = ("Map %s synced"):format(tostring(message.farmKey))
+    renderMap()
+end
+
+local function applyFarmDelta(message)
+    local current = liveFarmMaps[message.farmKey]
+    if not current then requestFarmSnapshot(message.farmKey) return end
+    local revision = tonumber(message.mapRevision)
+    local currentRevision = tonumber(current.revision) or 0
+    local baseRevision = tonumber(message.baseRevision)
+    if not revision or revision <= currentRevision then return end
+    if (baseRevision and baseRevision ~= currentRevision)
+        or (not baseRevision and revision ~= currentRevision + 1) then
+        requestFarmSnapshot(message.farmKey)
+        return
+    end
+    if type(message.chunkCount) ~= "number" or message.chunkCount < 1
+        or message.chunkCount > 4 or message.chunkCount % 1 ~= 0
+        or type(message.chunkIndex) ~= "number" or message.chunkIndex % 1 ~= 0
+        or message.chunkIndex < 1 or message.chunkIndex > message.chunkCount
+        or type(message.cells) ~= "table" or #message.cells > 32 then return end
+    prunePendingMaps(mapDeltas, 16)
+    local deltaKey = tostring(message.farmKey) .. ":" .. tostring(revision)
+    local pending = mapDeltas[deltaKey] or {
+        farmKey = message.farmKey, revision = revision, baseRevision = baseRevision,
+        chunkCount = message.chunkCount, chunks = {}, metadata = safeMapMetadata(message.metadata),
+        createdAt = os.epoch("utc"),
+    }
+    if pending.chunkCount ~= message.chunkCount or pending.baseRevision ~= baseRevision then
+        mapDeltas[deltaKey] = nil
+        requestFarmSnapshot(message.farmKey)
+        return
+    end
+    local cells = {}
+    for _, cell in ipairs(message.cells) do
+        local safeCell = safeMapCell(cell)
+        if safeCell then cells[#cells + 1] = safeCell end
+    end
+    pending.chunks[message.chunkIndex] = cells
+    mapDeltas[deltaKey] = pending
+    for chunkIndex = 1, pending.chunkCount do if not pending.chunks[chunkIndex] then return end end
+    current.data = current.data or { cells = {} }
+    current.data.cells = current.data.cells or {}
+    local additions = {}
+    for chunkIndex = 1, pending.chunkCount do
+        for _, cell in ipairs(pending.chunks[chunkIndex]) do
+            local key = ("%d:%d"):format(cell.x, cell.z)
+            if not current.data.cells[key] then additions[key] = true end
+        end
+    end
+    local additionCount = 0
+    for _ in pairs(additions) do additionCount = additionCount + 1 end
+    if cachedCellCount() + additionCount > 8192 then
+        mapDeltas[deltaKey] = nil
+        mapMessage = "Map cache limit reached"
+        return
+    end
+    for chunkIndex = 1, pending.chunkCount do
+        for _, cell in ipairs(pending.chunks[chunkIndex]) do
+            if validMapCell(cell) then current.data.cells[("%d:%d"):format(cell.x, cell.z)] = cell end
+        end
+    end
+    for field, value in pairs(pending.metadata) do current.data[field] = value end
+    current.revision = pending.revision
+    mapDeltas[deltaKey] = nil
+    mapMessage = ("Map r%s"):format(tostring(current.revision))
+    renderMap()
 end
 
 local function toggleAlerts(argument)
@@ -515,10 +1005,16 @@ end
 
 local function handleControllerMessage(sender, message)
     if type(message) ~= "table" then return end
+    if NATIVE_TABS and (message.type == "TURTLE_UPDATE"
+        or tostring(message.type):find("^FARM_MAP_")) then return end
     if message.type == "CONTROLLER_HELLO" then
         if message.controllerId ~= sender then return end
         if controllerId and sender ~= controllerId then return end
         local changed = controllerId ~= sender or controllerBootId ~= message.bootId
+        if changed then
+            liveFarmMaps, mapSnapshots, mapDeltas = {}, {}, {}
+            mapMessage = "Controller changed; syncing maps"
+        end
         if relayState.alertControllerBootId ~= message.bootId then
             relayState.alertControllerBootId = message.bootId
             relayState.seenAlertIds = {}
@@ -530,6 +1026,9 @@ local function handleControllerMessage(sender, message)
         controllerBootId = message.bootId
         completionTurtles = type(message.turtles) == "table" and message.turtles or completionTurtles
         completionSites = type(message.sites) == "table" and message.sites or completionSites
+        if not NATIVE_TABS and type(message.turtleStates) == "table" then
+            turtleStates = safeTurtleStates(message.turtleStates)
+        end
         if changed then controllerRegistered = false end
         if changed then
             printAsync(("Mining controller connected (computer %d)"):format(sender), false)
@@ -541,11 +1040,16 @@ local function handleControllerMessage(sender, message)
                 controllerBootId = controllerBootId,
             }, JOB_PROTOCOL)
         end
+        if controllerRegistered then requestFarmIndex(message.farmMapKeys) end
     elseif message.type == "RELAY_ACK" and sender == controllerId
         and message.controllerBootId == controllerBootId then
         controllerRegistered = true
         completionTurtles = type(message.turtles) == "table" and message.turtles or {}
         completionSites = type(message.sites) == "table" and message.sites or {}
+        if not NATIVE_TABS and type(message.turtleStates) == "table" then
+            turtleStates = safeTurtleStates(message.turtleStates)
+        end
+        saveRelayState()
         for _, command in ipairs(pendingCommands) do
             rednet.send(controllerId, {
                 type = "REMOTE_COMMAND", requestId = command.id,
@@ -553,6 +1057,7 @@ local function handleControllerMessage(sender, message)
             }, JOB_PROTOCOL)
         end
         requestAlertSync()
+        requestFarmIndex(message.farmMapKeys)
     elseif message.type == "REMOTE_OUTPUT" and sender == controllerId
         and message.controllerBootId == controllerBootId then
         if message.requestId then
@@ -566,6 +1071,42 @@ local function handleControllerMessage(sender, message)
                 end
             end
         end
+        printAsync(message.text or "", false)
+    elseif message.type == "TURTLE_UPDATE" and sender == controllerId
+        and message.controllerBootId == controllerBootId then
+        if type(message.turtle) == "table" and message.turtle.id then
+            local safe = safeTurtleStates({ [message.turtle.id] = message.turtle })
+            if safe[message.turtle.id] then turtleStates[message.turtle.id] = safe[message.turtle.id] end
+            renderMap()
+        end
+    elseif message.type == "FARM_MAP_SNAPSHOT_BEGIN" and sender == controllerId
+        and message.controllerBootId == controllerBootId then
+        local cellCount = tonumber(message.cellCount)
+        if type(message.farmKey) == "string" and type(message.snapshotId) == "string"
+            and #message.farmKey <= 128 and #message.snapshotId <= 256
+            and type(message.mapRevision) == "number"
+            and type(message.chunkCount) == "number" and message.chunkCount >= 1
+            and message.chunkCount <= 128 and message.chunkCount % 1 == 0
+            and cellCount and cellCount >= 0 and cellCount <= 4096 and cellCount % 1 == 0
+            and message.chunkCount == math.max(1, math.ceil(cellCount / 32)) then
+            prunePendingMaps(mapSnapshots, 8)
+            mapSnapshots[message.farmKey] = {
+                snapshotId = message.snapshotId, revision = message.mapRevision,
+                chunkCount = message.chunkCount, cellCount = cellCount, chunks = {},
+                metadata = safeMapMetadata(message.metadata), createdAt = os.epoch("utc"),
+            }
+        end
+    elseif message.type == "FARM_MAP_SNAPSHOT_CHUNK" and sender == controllerId
+        and message.controllerBootId == controllerBootId then
+        applySnapshotChunk(message)
+    elseif message.type == "FARM_MAP_SNAPSHOT_END" and sender == controllerId
+        and message.controllerBootId == controllerBootId then
+        finishSnapshot(message)
+    elseif message.type == "FARM_MAP_DELTA" and sender == controllerId
+        and message.controllerBootId == controllerBootId then
+        applyFarmDelta(message)
+    elseif message.type == "CONTROL_RESULT" and sender == controllerId
+        and message.controllerBootId == controllerBootId then
         printAsync(message.text or "", false)
     elseif message.type == "WORKER_ALERT" and sender == controllerId
         and relayState.alertsEnabled then
@@ -659,8 +1200,39 @@ local function forwardUpload(transfer)
     print("Upload accepted by the master deployment server.")
 end
 
+local function setupTerminalUi()
+    if not baseTerminal then baseTerminal = term.current() end
+    if commandWindow then commandWindow.setVisible(false) end
+    local width, height = baseTerminal.getSize()
+    term.redirect(baseTerminal)
+    local top = NATIVE_TABS and 1 or 2
+    commandWindow = window.create(baseTerminal, 1, top, width, math.max(1, height - top + 1), true)
+    term.redirect(commandWindow)
+    promptVisible = false
+    commandWindow.setVisible(activeTab == "command")
+    if not NATIVE_TABS then drawTabHeader() end
+    if activeTab == "map" then renderMap() end
+end
+
+local function announceCachedTargets()
+    for key, entry in pairs(cache) do
+        local project, target = key:match("^([^/]+)/(.+)$")
+        if project and target then
+            rednet.broadcast({
+                type = "UPDATE_AVAILABLE",
+                project = project,
+                target = target,
+                release = entry.release,
+                serverId = os.getComputerID(),
+                authority = false,
+            }, PROTOCOL)
+        end
+    end
+end
+
 if not openModem() then error("Relay requires an attached modem", 0) end
 loadRelayState()
+setupTerminalUi()
 recoverCacheTransactions()
 loadCachedTargets()
 if #pendingCommands > 0 then
@@ -671,15 +1243,18 @@ print("Network: " .. NETWORK_ID)
 print("This computer is a relay only. The master deployment PC remains authoritative.")
 print("Alerts " .. (relayState.alertsEnabled and "enabled" or "disabled") .. " (type 'alerts' to toggle)")
 
-local cacheAnnounceTimer = os.startTimer(5)
+announceCachedTargets()
+local cacheAnnounceTimer = os.startTimer(15)
+if not NATIVE_TABS then gpsTimer = os.startTimer(0.1) end
 
 local commandNames = {
-    "alerts", "cancel", "dig", "farm", "help", "jobs", "repair", "retry", "setup-farm",
+    "alerts", "cancel", "dig", "farm", "farm-expand", "farm-radius", "farm-service", "help", "jobs", "map", "repair", "retry", "setup-farm",
     "setup-room", "setup-station", "setup-tunnel", "sites", "survey",
     "surveys", "travel", "tunnel", "turtles",
 }
 local turtleCommands = {
-    cancel = true, dig = true, farm = true, repair = true, retry = true,
+    cancel = true, dig = true, farm = true, farm_expand = true, farm_radius = true,
+    farm_service = true, repair = true, retry = true,
     setup_farm = true, setup_room = true,
     setup_station = true, setup_tunnel = true, survey = true, travel = true, tunnel = true,
 }
@@ -704,6 +1279,12 @@ local function completeInput(value)
         else return value end
     elseif #words == 2 and (words[1] == "farm" or words[1] == "tunnel") then
         choices = completionSites
+    elseif #words == 2 and words[1] == "farm-service" then
+        choices = { "start", "status", "stop" }
+    elseif #words == 2 and words[1] == "farm-expand" then
+        choices = { "off", "on", "toggle" }
+    elseif #words == 2 and words[1] == "farm-radius" then
+        return value
     elseif #words > 0 then
         return value
     end
@@ -758,32 +1339,97 @@ local function recallHistory(direction)
     end
 end
 
+local function toggleFollow()
+    relayState.ui.followPlayer = not relayState.ui.followPlayer
+    if relayState.ui.followPlayer and playerPosition then
+        mapCenter.x, mapCenter.z = playerPosition.x, playerPosition.z
+    end
+    saveRelayState()
+    renderMap()
+end
+
+local function handleMapClick(button, x, y)
+    local width, height = terminalSize()
+    if y == 1 then
+        if x >= 1 and x <= 5 then switchTab("command") return end
+        if x >= 7 and x <= 11 then switchTab("map") return end
+        if activeTab == "map" and width >= 20 then
+            if x >= width - 10 and x <= width - 8 then setZoom(mapZoom() * 2) return end
+            if x >= width - 6 and x <= width - 4 then setZoom(math.floor(mapZoom() / 2)) return end
+            if x >= width - 2 then toggleFollow() return end
+        end
+    end
+    if activeTab ~= "map" or y < 2 or y >= height then return end
+    relayState.ui.followPlayer = false
+    local zoom = mapZoom()
+    local worldX, worldZ = worldDelta(
+        math.floor((x - width / 2) * zoom),
+        math.floor((y - 2 - (height - 2) / 2) * zoom)
+    )
+    mapCenter.x, mapCenter.z = mapCenter.x + worldX, mapCenter.z + worldZ
+    if button == 1 then setZoom(math.max(1, math.floor(zoom / 2)))
+    elseif button == 2 then setZoom(math.min(16, zoom * 2))
+    else renderMap() end
+end
+
+local function focusNativeMap()
+    if not NATIVE_TABS then return false end
+    for tab = 1, multishell.getCount() do
+        if multishell.getTitle(tab) == "Map" then
+            multishell.setFocus(tab)
+            return true
+        end
+    end
+    return false
+end
+
 while true do
     if not promptVisible then
         drawPrompt("")
         promptVisible = true
     end
     local event, first, second, third = nextEvent()
-    if event == "monitor_resize" and refreshMonitor then
+    if event == "term_resize" then
+        setupTerminalUi()
+    elseif event == "mouse_click" and not NATIVE_TABS then
+        handleMapClick(first, second, third)
+    elseif event == "mouse_scroll" and activeTab == "map" then
+        if first > 0 then setZoom(mapZoom() * 2)
+        else setZoom(math.floor(mapZoom() / 2)) end
+    elseif event == "monitor_resize" and refreshMonitor then
         refreshMonitor()
-    elseif event == "char" then
+    elseif event == "char" and activeTab == "map" then
+        if first == "+" or first == "=" then setZoom(math.floor(mapZoom() / 2))
+        elseif first == "-" then setZoom(mapZoom() * 2)
+        elseif string.lower(first) == "f" then toggleFollow() end
+    elseif event == "char" and activeTab == "command" then
         resetCompletion()
         historyIndex = nil
         input = input .. first
         write(first)
-    elseif event == "key" and first == keys.backspace and #input > 0 then
+    elseif event == "key" and activeTab == "map" and first == keys.left then
+        panMap(-1, 0)
+    elseif event == "key" and activeTab == "map" and first == keys.right then
+        panMap(1, 0)
+    elseif event == "key" and activeTab == "map" and first == keys.up then
+        panMap(0, -1)
+    elseif event == "key" and activeTab == "map" and first == keys.down then
+        panMap(0, 1)
+    elseif event == "key" and activeTab == "map" and first == keys.tab then
+        switchTab("command")
+    elseif event == "key" and activeTab == "command" and first == keys.backspace and #input > 0 then
         resetCompletion()
         historyIndex = nil
         input = input:sub(1, -2)
         clearPrompt()
         drawPrompt(input)
-    elseif event == "key" and first == keys.tab then
+    elseif event == "key" and activeTab == "command" and first == keys.tab then
         replacePromptInput(completeInput(input))
-    elseif event == "key" and first == keys.up then
+    elseif event == "key" and activeTab == "command" and first == keys.up then
         recallHistory(-1)
-    elseif event == "key" and first == keys.down then
+    elseif event == "key" and activeTab == "command" and first == keys.down then
         recallHistory(1)
-    elseif event == "key" and first == keys.enter then
+    elseif event == "key" and activeTab == "command" and first == keys.enter then
         resetCompletion()
         print()
         if input ~= "" then
@@ -793,6 +1439,8 @@ while true do
             if command == "alerts" then
                 if extra ~= "" then printError("Usage: alerts [on|off|status]")
                 else toggleAlerts(argument) end
+            elseif command == "map" then
+                if not focusNativeMap() then switchTab("map") end
             else
                 sendControllerCommand(input)
             end
@@ -801,20 +1449,30 @@ while true do
         historyIndex = nil
         historyDraft = ""
         promptVisible = false
-    elseif event == "timer" and first == cacheAnnounceTimer then
-        for key, entry in pairs(cache) do
-            local project, target = key:match("^([^/]+)/(.+)$")
-            if project and target then
-                rednet.broadcast({
-                    type = "UPDATE_AVAILABLE",
-                    project = project,
-                    target = target,
-                    release = entry.release,
-                    serverId = os.getComputerID(),
-                    authority = false,
-                }, PROTOCOL)
+    elseif event == "timer" and first == gpsTimer then
+        local expired = prunePendingMaps(mapSnapshots, math.huge)
+        for _, farmKey in ipairs(prunePendingMaps(mapDeltas, math.huge)) do
+            expired[#expired + 1] = farmKey
+        end
+        local requested = {}
+        for _, farmKey in ipairs(expired) do
+            if farmKey and not requested[farmKey] then
+                requested[farmKey] = true
+                requestFarmSnapshot(farmKey)
             end
         end
+        local x, y, z = gps.locate(0.2, false)
+        if x then
+            updatePlayerGps(x, y, z)
+            if relayState.ui.followPlayer then mapCenter.x, mapCenter.z = x, z end
+            mapMessage = "GPS locked"
+        else
+            mapMessage = "GPS unavailable"
+        end
+        gpsTimer = os.startTimer(2)
+        renderMap()
+    elseif event == "timer" and first == cacheAnnounceTimer then
+        announceCachedTargets()
         cacheAnnounceTimer = os.startTimer(15)
     elseif event == "file_transfer" then
         forwardUpload(first)
@@ -824,11 +1482,18 @@ while true do
             and message.project and message.target and message.serverId == first
             and message.authority ~= false then
             masterId = first
-            local ok, syncError = syncTarget(message.project, message.target)
+            local ok, synced = syncTarget(message.project, message.target)
             if ok then
-                rednet.broadcast(message, PROTOCOL)
+                rednet.broadcast({
+                    type = "UPDATE_AVAILABLE",
+                    project = message.project,
+                    target = message.target,
+                    release = synced.release,
+                    serverId = os.getComputerID(),
+                    authority = false,
+                }, PROTOCOL)
             else
-                printError("Relay cache update failed: " .. tostring(syncError))
+                printError("Relay cache update failed: " .. tostring(synced))
             end
         else
             handleClient(first, message)
@@ -836,4 +1501,5 @@ while true do
     elseif event == "rednet_message" and third == JOB_PROTOCOL then
         handleControllerMessage(first, second)
     end
+    if activeTab == "map" then renderMap() end
 end

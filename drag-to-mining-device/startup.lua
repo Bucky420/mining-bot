@@ -194,10 +194,53 @@ local function stageFile(path, contents)
     return true
 end
 
-local function launchInstalledApplication()
+local function receiveUpdateAnnouncement(installedRelease)
+    -- Never swap turtle upgrades from the supervisor. The worker restores its
+    -- modem when it is safe for networking to resume.
+    if not peripheral.find("modem") then sleep(1) return nil end
+    local opened = false
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "modem" then
+            if not rednet.isOpen(name) then rednet.open(name) end
+            opened = true
+        end
+    end
+    if not opened then return nil end
+    local _, message = rednet.receive(PROTOCOL, 1)
+    if type(message) == "table" and message.type == "UPDATE_AVAILABLE"
+        and message.project == PROJECT and message.target == TARGET
+        and type(message.release) == "string" and message.release ~= installedRelease then
+        return message.release
+    end
+    return nil
+end
+
+local function launchInstalledApplication(installedRelease)
     local application = TARGET == "turtle" and "/worker.lua" or "/controller.lua"
-    local applicationOk = shell.run(application)
-    if not applicationOk then printError("Application stopped with an error: " .. application) end
+    local applicationRunning = true
+    local acknowledgedRelease
+    parallel.waitForAll(
+        function()
+            local applicationOk = shell.run(application)
+            applicationRunning = false
+            os.queueEvent("bucky_application_stopped")
+            if not applicationOk then printError("Application stopped with an error: " .. application) end
+        end,
+        function()
+            while applicationRunning do
+                local release = receiveUpdateAnnouncement(installedRelease)
+                if release and release ~= acknowledgedRelease then
+                    os.queueEvent("bucky_deployment_update", release)
+                end
+            end
+        end,
+        function()
+            while applicationRunning do
+                local _, release = os.pullEvent("bucky_deployment_update_ack")
+                acknowledgedRelease = release
+            end
+        end
+    )
 end
 
 local interrupted = readTable(INSTALLING)
@@ -223,7 +266,7 @@ local modemOk, modemError = openModems()
 if not modemOk then
     if saved and not interrupted then
         printError("Update check unavailable: " .. tostring(modemError))
-        launchInstalledApplication()
+        launchInstalledApplication(saved and saved.release)
         return
     end
     error("Installer requires a modem: " .. tostring(modemError), 0)
@@ -233,7 +276,7 @@ local serverId, discoveryError = discoverServer()
 if not serverId then
     if saved and not interrupted then
         printError("Deployment master offline: " .. tostring(discoveryError))
-        launchInstalledApplication()
+        launchInstalledApplication(saved and saved.release)
         return
     end
     error(discoveryError, 0)
@@ -247,7 +290,7 @@ local manifest, manifestError = receiveFrom(serverId, "MANIFEST", manifestNonce)
 if not manifest then
     if saved and not interrupted then
         printError("Update check unavailable: " .. tostring(manifestError))
-        launchInstalledApplication()
+        launchInstalledApplication(saved and saved.release)
         return
     end
     error("Manifest request failed: " .. tostring(manifestError), 0)
@@ -255,7 +298,9 @@ end
 if saved and not interrupted and saved.project == PROJECT and saved.target == TARGET
     and saved.release == manifest.release then
     print(("%s/%s is current (%s)."):format(PROJECT, TARGET, manifest.release))
-    if fs.getName(shell.getRunningProgram()) == "startup.lua" then launchInstalledApplication() end
+    if fs.getName(shell.getRunningProgram()) == "startup.lua" then
+        launchInstalledApplication(saved and saved.release)
+    end
     return
 end
 if type(manifest.files) ~= "table" or #manifest.files == 0 then

@@ -3,6 +3,8 @@ local JOB_PROTOCOL = NETWORK_ID .. "/mining/v1"
 local DEPLOY_PROTOCOL = NETWORK_ID .. "/deployment/v1"
 local STATE_PATH = "/data/controller.state"
 local BOOT_ID = ("%d:%d"):format(os.getComputerID(), os.epoch("utc"))
+local storage = require("lib.controller_storage")
+local routePlanner = require("lib.controller_route")
 
 local function detachedCopy(value, ancestors)
     if type(value) ~= "table" then return value end
@@ -15,6 +17,30 @@ local function detachedCopy(value, ancestors)
     end
     ancestors[value] = nil
     return result
+end
+
+local function boundFarmMaps(farmMaps, preserveKey)
+    local changed = false
+    for farmKey, farmMap in pairs(farmMaps) do
+        local data = type(farmMap.data) == "table" and farmMap.data or {}
+        local cells = {}
+        for _, cell in pairs(type(data.cells) == "table" and data.cells or {}) do
+            if type(cell) == "table" and type(cell.x) == "number"
+                and type(cell.y) == "number" and type(cell.z) == "number" then
+                cells[#cells + 1] = cell
+            else
+                changed = true
+            end
+        end
+        if type(data.cells) == "table" then
+            data.cells = {}
+            for _, cell in ipairs(cells) do
+                data.cells[("%d:%d"):format(cell.x, cell.z)] = cell
+            end
+        end
+        farmMap.data = data
+    end
+    return changed
 end
 
 local function enableMonitorOutput()
@@ -85,24 +111,36 @@ local function openModems()
 end
 
 local function loadState()
-    for _, path in ipairs({ STATE_PATH, STATE_PATH .. ".tmp", STATE_PATH .. ".previous" }) do
+    for _, path in ipairs({ STATE_PATH, STATE_PATH .. ".previous", STATE_PATH .. ".tmp" }) do
         if fs.exists(path) then
             local handle = fs.open(path, "r")
             if handle then
                 local value = textutils.unserialize(handle.readAll())
                 handle.close()
                 if type(value) == "table" then
-                    value.turtles = value.turtles or {}
-                    value.jobs = value.jobs or {}
-                    value.processedReports = value.processedReports or {}
-                    value.processedReportOrder = value.processedReportOrder or {}
+                    local valid = true
+                    for _, field in ipairs({
+                        "turtles", "jobs", "processedReports", "processedReportOrder",
+                        "remoteCommands", "remoteCommandOrder", "sites", "farmMaps",
+                        "surveys", "alerts", "relays", "terrainStorage",
+                    }) do
+                        if value[field] == nil then value[field] = {}
+                        elseif type(value[field]) ~= "table" then valid = false end
+                    end
+                    if type(value.nextTurtleNumber) ~= "number" and value.nextTurtleNumber ~= nil
+                        or type(value.nextAlertSequence) ~= "number" and value.nextAlertSequence ~= nil then
+                        valid = false
+                    end
+                    for _, turtleInfo in pairs(value.turtles or {}) do
+                        if type(turtleInfo) ~= "table" then valid = false break end
+                    end
+                    for _, alert in ipairs(value.alerts or {}) do
+                        if type(alert) ~= "table" then valid = false break end
+                    end
+                    if not valid then value = nil end
+                end
+                if type(value) == "table" then
                     value.nextTurtleNumber = value.nextTurtleNumber or 1
-                    value.remoteCommands = value.remoteCommands or {}
-                    value.remoteCommandOrder = value.remoteCommandOrder or {}
-                    value.sites = value.sites or {}
-                    value.surveys = value.surveys or {}
-                    value.alerts = value.alerts or {}
-                    value.relays = value.relays or {}
                     value.nextAlertSequence = value.nextAlertSequence or 1
                     for index, alert in ipairs(value.alerts) do
                         alert.id = alert.id or ("legacy-%s-%d"):format(tostring(alert.at or 0), index)
@@ -115,12 +153,15 @@ local function loadState()
     return {
         version = 1, turtles = {}, jobs = {}, processedReports = {}, processedReportOrder = {},
         nextTurtleNumber = 1, nextAlertSequence = 1, remoteCommands = {}, remoteCommandOrder = {},
-        sites = {}, surveys = {}, alerts = {}, relays = {},
+        sites = {}, farmMaps = {}, surveys = {}, alerts = {}, relays = {}, terrainStorage = {},
     }
 end
 
 local controllerState = loadState()
+local farmMapsTrimmedAtBoot = boundFarmMaps(controllerState.farmMaps)
 local activeRelays = {}
+local announcedTurtleRelease
+for _, turtleInfo in pairs(controllerState.turtles) do turtleInfo.online = false end
 
 local function installedRelease()
     if not fs.exists("/data/deployment.state") then return nil end
@@ -136,18 +177,139 @@ local function saveState()
     local temporary = STATE_PATH .. ".tmp"
     local handle = fs.open(temporary, "w")
     if not handle then return false end
-    handle.write(textutils.serialize(detachedCopy(controllerState), { compact = true }))
+    local snapshot = detachedCopy(controllerState)
+    for farmKey, farmMap in pairs(snapshot.farmMaps) do
+        local stored = snapshot.terrainStorage[farmKey]
+        if stored and tonumber(stored.revision) >= (tonumber(farmMap.revision) or 0)
+            and type(farmMap.data) == "table" then
+            farmMap.data.cells = nil
+        end
+    end
+    handle.write(textutils.serialize(snapshot, { compact = true }))
     handle.close()
     local previous = STATE_PATH .. ".previous"
-    if fs.exists(previous) then fs.delete(previous) end
-    if fs.exists(STATE_PATH) then
-        fs.copy(STATE_PATH, previous)
-        fs.delete(STATE_PATH)
+    local ok = pcall(function()
+        if fs.exists(previous) then fs.delete(previous) end
+        if fs.exists(STATE_PATH) then fs.move(STATE_PATH, previous) end
+        fs.move(temporary, STATE_PATH)
+    end)
+    if not ok then
+        if not fs.exists(STATE_PATH) and fs.exists(previous) then pcall(fs.move, previous, STATE_PATH) end
+        return false
     end
-    fs.move(temporary, STATE_PATH)
-    if fs.exists(previous) then fs.delete(previous) end
-    return true
+    return fs.exists(STATE_PATH)
 end
+
+local function loadFarmMap(farmKey)
+    local farmMap = controllerState.farmMaps[farmKey]
+    if not farmMap then return nil, "FARM_MAP_NOT_FOUND" end
+    if type(farmMap.data) == "table" and type(farmMap.data.cells) == "table" then return farmMap end
+    local stored, storageError = storage.readFarm(controllerState.terrainStorage[farmKey])
+    if not stored or tonumber(stored.revision) ~= tonumber(farmMap.revision) then
+        return nil, storageError or "TERRAIN_REVISION_MISMATCH"
+    end
+    farmMap.data = stored.data
+    return farmMap
+end
+
+local function handleFarmRouteRequest(sender, message)
+    local requestId = type(message.requestId) == "string" and message.requestId
+    local start, target = message.start, message.target
+    local function reject(reason)
+        rednet.send(sender, {
+            type = "FARM_ROUTE_RESPONSE", requestId = requestId,
+            ok = false, error = reason, controllerBootId = BOOT_ID,
+        }, JOB_PROTOCOL)
+    end
+    if not requestId or not controllerState.turtles[sender] then return reject("UNREGISTERED_WORKER") end
+    if type(start) ~= "table" or type(target) ~= "table"
+        or type(start.x) ~= "number" or type(start.z) ~= "number"
+        or type(target.x) ~= "number" or type(target.z) ~= "number"
+        or start.x ~= math.floor(start.x) or start.z ~= math.floor(start.z)
+        or target.x ~= math.floor(target.x) or target.z ~= math.floor(target.z) then
+        return reject("INVALID_ROUTE_COORDINATES")
+    end
+    local farmMap, loadError = loadFarmMap(message.farmId)
+    if not farmMap then return reject(loadError) end
+    if type(message.minRevision) == "number" and farmMap.revision < message.minRevision then
+        farmMap.data.cells = nil
+        return reject("CONTROLLER_TERRAIN_STALE")
+    end
+    local path = routePlanner.find(farmMap.data.cells or {}, start, target, message.heading)
+    if not path then return reject("NO_SAFE_CONTROLLER_ROUTE") end
+    rednet.send(sender, {
+        type = "FARM_ROUTE_RESPONSE", requestId = requestId, ok = true,
+        path = path, mapRevision = farmMap.revision, controllerBootId = BOOT_ID,
+    }, JOB_PROTOCOL)
+    farmMap.data.cells = nil
+end
+
+local function handleFarmTerrainRequest(sender, message)
+    local requestId = type(message.requestId) == "string" and message.requestId
+    local farmMap, loadError
+    if requestId and controllerState.turtles[sender] then
+        farmMap, loadError = loadFarmMap(message.farmId)
+    else
+        loadError = "UNREGISTERED_WORKER"
+    end
+    if not farmMap then
+        rednet.send(sender, {
+            type = "FARM_TERRAIN_RESPONSE", requestId = requestId,
+            ok = false, error = loadError, controllerBootId = BOOT_ID,
+        }, JOB_PROTOCOL)
+        return
+    end
+    if type(message.minRevision) == "number" and farmMap.revision < message.minRevision then
+        farmMap.data.cells = nil
+        rednet.send(sender, {
+            type = "FARM_TERRAIN_RESPONSE", requestId = requestId,
+            ok = false, error = "CONTROLLER_TERRAIN_STALE", controllerBootId = BOOT_ID,
+        }, JOB_PROTOCOL)
+        return
+    end
+    local cells = {}
+    for _, cell in pairs(farmMap.data.cells or {}) do cells[#cells + 1] = detachedCopy(cell) end
+    table.sort(cells, function(a, b) return a.x == b.x and a.z < b.z or a.x < b.x end)
+    local chunkCount = math.max(1, math.ceil(#cells / 32))
+    rednet.send(sender, {
+        type = "FARM_TERRAIN_BEGIN", requestId = requestId, ok = true,
+        revision = farmMap.revision, chunkCount = chunkCount, cellCount = #cells,
+        controllerBootId = BOOT_ID,
+    }, JOB_PROTOCOL)
+    for chunkIndex = 1, chunkCount do
+        local chunk, first = {}, (chunkIndex - 1) * 32 + 1
+        for index = first, math.min(first + 31, #cells) do chunk[#chunk + 1] = cells[index] end
+        rednet.send(sender, {
+            type = "FARM_TERRAIN_CHUNK", requestId = requestId,
+            chunkIndex = chunkIndex, chunkCount = chunkCount, cells = chunk,
+            controllerBootId = BOOT_ID,
+        }, JOB_PROTOCOL)
+    end
+    rednet.send(sender, {
+        type = "FARM_TERRAIN_END", requestId = requestId,
+        revision = farmMap.revision, chunkCount = chunkCount, controllerBootId = BOOT_ID,
+    }, JOB_PROTOCOL)
+    farmMap.data.cells = nil
+end
+
+local storageChanged = false
+for farmKey, farmMap in pairs(controllerState.farmMaps) do
+    if type(farmMap.data) == "table" and type(farmMap.data.cells) == "table"
+        and next(farmMap.data.cells) ~= nil then
+        local stored, storageError = storage.writeFarm(
+            farmKey, farmMap, controllerState.terrainStorage[farmKey]
+        )
+        if stored then
+            controllerState.terrainStorage[farmKey] = stored
+            storageChanged = true
+        else
+            printError(("Terrain migration deferred for %s: %s"):format(
+                tostring(farmKey), tostring(storageError)
+            ))
+        end
+    end
+end
+if farmMapsTrimmedAtBoot or storageChanged then saveState() end
 
 local actionableStatuses = {
     NEEDS_FUEL = true,
@@ -334,11 +496,28 @@ local function parseInteger(value, name)
 end
 
 local function sendJob(turtleId, jobType, parameters, fixedId)
+    local turtleInfo = controllerState.turtles[turtleId]
+    if not turtleInfo then
+        printError("UNKNOWN_COMPUTER: turtle " .. tostring(turtleId) .. " is not registered")
+        return false, "UNKNOWN_COMPUTER"
+    end
+    if turtleInfo.online == false
+        or not turtleInfo.lastSeen or os.epoch("utc") - turtleInfo.lastSeen > 45000 then
+        printError("Turtle " .. tostring(turtleId) .. " is offline")
+        return false, "TURTLE_OFFLINE"
+    end
+    if turtleInfo.navigationReady == false then
+        local reason = "Navigation is not ready"
+        if turtleInfo.navigationError then reason = reason .. ": " .. tostring(turtleInfo.navigationError) end
+        printError(reason)
+        return false, reason
+    end
     local id = fixedId or jobId()
     if controllerState.jobs[id] then return true, "Job " .. id .. " was already submitted" end
     local job = { id = id, type = jobType, parameters = parameters, progress = {} }
     controllerState.jobs[job.id] = {
-        turtleId = turtleId, type = jobType, status = "PENDING_SEND", createdAt = os.epoch("utc"),
+        turtleId = turtleId, type = jobType, parameters = detachedCopy(parameters),
+        status = "PENDING_SEND", createdAt = os.epoch("utc"),
     }
     if not saveState() then
         controllerState.jobs[job.id] = nil
@@ -371,11 +550,27 @@ local function resolveTurtle(value)
     return nil
 end
 
-local function sendControl(turtleId, action)
-    if not rednet.send(turtleId, { type = "CONTROL_JOB", action = action }, JOB_PROTOCOL) then
+local function sendControl(turtleId, action, parameters)
+    local message = { type = "CONTROL_JOB", action = action }
+    if parameters then message.parameters = parameters end
+    if not rednet.send(turtleId, message, JOB_PROTOCOL) then
         return false, "Unable to send control command"
     end
     return true, ("%s sent to turtle %d"):format(action, turtleId)
+end
+
+local function activeFarmJobId(turtleId)
+    local foundId, foundAt
+    for id, job in pairs(controllerState.jobs) do
+        local terminal = job.status == "JOB_COMPLETE" or job.status == "JOB_FAILED"
+            or job.status == "JOB_CANCELLED" or job.status == "JOB_REJECTED"
+            or job.status == "SEND_FAILED"
+        if job.turtleId == turtleId and job.type == "FARM_SERVICE" and not terminal then
+            local createdAt = tonumber(job.createdAt) or 0
+            if not foundAt or createdAt > foundAt then foundId, foundAt = id, createdAt end
+        end
+    end
+    return foundId
 end
 
 local function showHelp()
@@ -386,6 +581,10 @@ local function showHelp()
     print("dig <turtle-name> <direction> <length> [profile]")
     print("repair <turtle-name> <x> <y> <z> <marker-type>")
     print("survey <turtle-name> [radius] [exact-block-name]")
+    print("farm-service <turtle-name> start [radius]")
+    print("farm-service <turtle-name> stop | status")
+    print("farm-expand <turtle-name> [on|off|toggle]")
+    print("farm-radius <turtle-name> <radius>")
     print("farm <turtle-name> <farm-id> [mature-age] [seed-name]")
     print("tunnel <turtle-name> <tunnel-id> <length>")
     print("setup-station <turtle-name> <id> <supply-direction> <output-direction>")
@@ -393,6 +592,7 @@ local function showHelp()
     print("setup-farm <turtle-name> <id> <width> <length> <direction> <crop> <seed> [age] <station-id>")
     print("setup-room <turtle-name> <id> <type> <direction> <width> <length> <height>")
     print("sites | surveys")
+    print("storage")
     print("help")
 end
 
@@ -403,7 +603,7 @@ local function handleCommand(line, fixedJobId)
     if command == "" then return end
     if command == "help" then
         showHelp()
-        return true, "turtles | jobs | sites | surveys | retry | cancel | travel | dig | repair | survey | farm | tunnel | setup-* | help"
+        return true, "turtles | jobs | sites | surveys | storage | retry | cancel | travel | dig | repair | survey | farm-service | farm-expand | farm-radius | farm | tunnel | setup-* | help"
     end
     if command == "turtles" then
         local result = textutils.serialize(controllerState.turtles)
@@ -417,6 +617,11 @@ local function handleCommand(line, fixedJobId)
     end
     if command == "sites" or command == "surveys" then
         local result = textutils.serialize(controllerState[command])
+        print(result)
+        return true, result
+    end
+    if command == "storage" then
+        local result = textutils.serialize(storage.describe())
         print(result)
         return true, result
     end
@@ -438,7 +643,39 @@ local function handleCommand(line, fixedJobId)
     end
     local turtleId = resolveTurtle(tokens[2])
     if not turtleId then return false, "Unknown turtle" end
-    if command == "retry" or command == "cancel" then
+    if command == "farm-service" then
+        local operation = string.lower(tokens[3] or "")
+        if operation == "start" then
+            local radius = tokens[4] and parseInteger(tokens[4], "radius") or 32
+            if not radius or radius < 1 or radius > 32 then return false, "radius must be from 1 to 32" end
+            return sendJob(turtleId, "FARM_SERVICE", {
+                radius = radius, autoExpand = true,
+            }, fixedJobId)
+        elseif operation == "stop" then
+            local farmJobId = activeFarmJobId(turtleId)
+            if not farmJobId then return false, "No tracked farm service for this turtle" end
+            return sendControl(turtleId, "farm_cancel", { jobId = farmJobId })
+        elseif operation == "status" then
+            return sendControl(turtleId, "farm_status", { jobId = activeFarmJobId(turtleId) })
+        end
+        return false, "Usage: farm-service <turtle-name> start [radius] | stop | status"
+    elseif command == "farm-expand" then
+        local value = string.lower(tokens[3] or "toggle")
+        if value ~= "on" and value ~= "off" and value ~= "toggle" then
+            return false, "farm-expand option must be on, off, or toggle"
+        end
+        local parameters = {}
+        if value ~= "toggle" then parameters.autoExpand = value == "on" end
+        parameters.jobId = activeFarmJobId(turtleId)
+        if not parameters.jobId then return false, "No tracked farm service for this turtle" end
+        return sendControl(turtleId, "farm_expand", parameters)
+    elseif command == "farm-radius" then
+        local radius = parseInteger(tokens[3], "radius")
+        if not radius or radius < 1 or radius > 32 then return false, "radius must be from 1 to 32" end
+        local farmJobId = activeFarmJobId(turtleId)
+        if not farmJobId then return false, "No tracked farm service for this turtle" end
+        return sendControl(turtleId, "farm_radius", { radius = radius, jobId = farmJobId })
+    elseif command == "retry" or command == "cancel" then
         local action = command
         if command == "retry" and tokens[3] then
             if tokens[3] == "on" then action = "retry_on"
@@ -553,18 +790,192 @@ local function handleCommand(line, fixedJobId)
     end
 end
 
+local function relayTurtleStates()
+    local result = {}
+    for id, turtleInfo in pairs(controllerState.turtles) do
+        result[id] = {
+            id = id, name = turtleInfo.name, label = turtleInfo.label,
+            status = turtleInfo.status, position = detachedCopy(turtleInfo.position),
+            heading = turtleInfo.heading, positionVerifiedAt = turtleInfo.positionVerifiedAt,
+            lastSeen = turtleInfo.lastSeen, online = turtleInfo.online,
+            release = turtleInfo.release,
+        }
+    end
+    return result
+end
+
+local function farmMapIndex()
+    local result = {}
+    for farmKey, farmMap in pairs(controllerState.farmMaps) do
+        local data = farmMap.data or {}
+        result[#result + 1] = {
+            farmKey = farmKey, revision = farmMap.revision,
+            center = detachedCopy(data.center), radius = data.radius,
+            phase = data.phase, knownColumns = data.knownColumns,
+        }
+    end
+    table.sort(result, function(a, b) return tostring(a.farmKey) < tostring(b.farmKey) end)
+    return result
+end
+
+local function expireTurtleLeases()
+    local now = os.epoch("utc")
+    for _, turtleInfo in pairs(controllerState.turtles) do
+        if turtleInfo.online ~= false and (not turtleInfo.lastSeen or now - turtleInfo.lastSeen > 45000) then
+            turtleInfo.online = false
+            printError(("%s offline: heartbeat lease expired"):format(
+                turtleInfo.name or ("turtle-" .. tostring(turtleInfo.id))
+            ))
+            for relayId in pairs(activeRelays) do
+                rednet.send(relayId, {
+                    type = "TURTLE_UPDATE", controllerBootId = BOOT_ID,
+                    turtle = detachedCopy(turtleInfo),
+                }, JOB_PROTOCOL)
+            end
+        end
+    end
+end
+
+local currentHeartbeatNonce
 local function controllerHello(recipient)
     local turtles, sites = completionSnapshot()
+    local sentAt = os.epoch("utc")
+    currentHeartbeatNonce = currentHeartbeatNonce or BOOT_ID .. ":" .. tostring(sentAt)
     local message = {
         type = "CONTROLLER_HELLO",
         controllerId = os.getComputerID(),
         bootId = BOOT_ID,
         turtles = turtles,
+        turtleStates = relayTurtleStates(),
         sites = sites,
-        sentAt = os.epoch("utc"),
+        farmMapKeys = farmMapIndex(),
+        sentAt = sentAt,
+        heartbeatNonce = currentHeartbeatNonce,
     }
     if recipient then rednet.send(recipient, message, JOB_PROTOCOL)
     else rednet.broadcast(message, JOB_PROTOCOL) end
+end
+
+local function controllerHeartbeat()
+    local sentAt = os.epoch("utc")
+    currentHeartbeatNonce = BOOT_ID .. ":" .. tostring(sentAt)
+    rednet.broadcast({
+        type = "CONTROLLER_HELLO",
+        controllerId = os.getComputerID(),
+        bootId = BOOT_ID,
+        heartbeatNonce = currentHeartbeatNonce,
+        sentAt = sentAt,
+    }, JOB_PROTOCOL)
+end
+
+
+local function sendFarmSnapshot(recipient, farmKey)
+    local farmMap = loadFarmMap(farmKey)
+    if not farmMap then return false end
+    local data = farmMap.data or {}
+    local cells = {}
+    for _, cell in pairs(data.cells or {}) do cells[#cells + 1] = detachedCopy(cell) end
+    table.sort(cells, function(a, b)
+        return a.x == b.x and a.z < b.z or a.x < b.x
+    end)
+    local chunkCount = math.max(1, math.ceil(#cells / 32))
+    local snapshotId = ("%s:%s:%d"):format(BOOT_ID, tostring(farmKey), os.epoch("utc"))
+    local metadata = {
+        farmId = data.farmId, jobId = data.jobId, phase = data.phase,
+        center = detachedCopy(data.center), radius = data.radius,
+        autoExpand = data.autoExpand, knownColumns = data.knownColumns,
+        summary = detachedCopy(data.summary),
+    }
+    rednet.send(recipient, {
+        type = "FARM_MAP_SNAPSHOT_BEGIN", controllerBootId = BOOT_ID,
+        farmKey = farmKey, snapshotId = snapshotId,
+        mapRevision = farmMap.revision, chunkCount = chunkCount,
+        cellCount = #cells, metadata = metadata,
+    }, JOB_PROTOCOL)
+    for chunkIndex = 1, chunkCount do
+        local chunk = {}
+        local first = (chunkIndex - 1) * 32 + 1
+        for index = first, math.min(first + 31, #cells) do chunk[#chunk + 1] = cells[index] end
+        rednet.send(recipient, {
+            type = "FARM_MAP_SNAPSHOT_CHUNK", controllerBootId = BOOT_ID,
+            farmKey = farmKey, snapshotId = snapshotId,
+            mapRevision = farmMap.revision, chunkIndex = chunkIndex,
+            chunkCount = chunkCount, cells = chunk,
+        }, JOB_PROTOCOL)
+    end
+    rednet.send(recipient, {
+        type = "FARM_MAP_SNAPSHOT_END", controllerBootId = BOOT_ID,
+        farmKey = farmKey, snapshotId = snapshotId,
+        mapRevision = farmMap.revision, chunkCount = chunkCount,
+    }, JOB_PROTOCOL)
+    return true
+end
+
+local function sendFarmDelta(recipient, farmKey, farmMap, delta, baseRevision)
+    delta = delta or {}
+    local chunkCount = math.max(1, math.ceil(#delta / 32))
+    for chunkIndex = 1, chunkCount do
+        local chunk = {}
+        local first = (chunkIndex - 1) * 32 + 1
+        for index = first, math.min(first + 31, #delta) do chunk[#chunk + 1] = detachedCopy(delta[index]) end
+        local data = farmMap.data or {}
+        rednet.send(recipient, {
+            type = "FARM_MAP_DELTA", controllerBootId = BOOT_ID,
+            farmKey = farmKey, mapRevision = farmMap.revision,
+            baseRevision = baseRevision,
+            chunkIndex = chunkIndex, chunkCount = chunkCount, cells = chunk,
+            metadata = {
+                center = detachedCopy(data.center), radius = data.radius,
+                phase = data.phase, knownColumns = data.knownColumns,
+                autoExpand = data.autoExpand, summary = detachedCopy(data.summary),
+            },
+        }, JOB_PROTOCOL)
+    end
+end
+
+local function storeFarmMap(value, fallbackId)
+    if type(value) ~= "table" then return nil, false end
+    local map = value.farmMap or value.map or value.terrain or value
+    if type(map) ~= "table" then return nil, false end
+    local key = map.farmId or map.siteId or map.id or fallbackId
+    if not key then return nil, false end
+    local previous = controllerState.farmMaps[key]
+    local revision = tonumber(map.revision or map.mapRevision)
+        or previous and (tonumber(previous.revision) or 0) + 1 or 1
+    if previous and revision <= (tonumber(previous.revision) or 0) then return key, false end
+    if previous then
+        local loaded, loadError = loadFarmMap(key)
+        if not loaded then return key, false, false, loadError end
+        previous = loaded
+    end
+    local data = detachedCopy(map)
+    local cells = {}
+    if type(map.cells) ~= "table" then
+        cells = previous and previous.data and detachedCopy(previous.data.cells) or {}
+    end
+    for _, cell in pairs(type(map.cells) == "table" and map.cells or map.delta or {}) do
+        if type(cell) == "table" and type(cell.x) == "number"
+            and type(cell.y) == "number" and type(cell.z) == "number" then
+            cells[("%d:%d"):format(cell.x, cell.z)] = detachedCopy(cell)
+        end
+    end
+    data.delta = nil
+    data.cells = cells
+    local candidate = {
+        revision = revision,
+        data = data,
+        updatedAt = os.epoch("utc"),
+    }
+    local cellCount = 0
+    for _ in pairs(cells) do cellCount = cellCount + 1 end
+    data.knownColumns = cellCount
+    local stored, storageError = storage.writeFarm(
+        key, candidate, controllerState.terrainStorage[key]
+    )
+    if not stored then return key, false, false, storageError end
+    controllerState.terrainStorage[key] = stored
+    controllerState.farmMaps[key] = candidate
+    return key, true, false
 end
 
 local function handleRemoteCommand(sender, message)
@@ -599,8 +1010,10 @@ local function handleRemoteCommand(sender, message)
         output = textutils.serialize(controllerState.jobs)
     elseif name == "sites" or name == "surveys" then
         output = textutils.serialize(controllerState[name])
+    elseif name == "storage" then
+        output = textutils.serialize(storage.describe())
     elseif name == "help" then
-        output = "turtles | jobs | sites | surveys | retry | cancel | travel | dig | repair | survey | farm | tunnel | setup-* | help"
+        output = "turtles | jobs | sites | surveys | storage | retry | cancel | travel | dig | repair | survey | farm-service | farm-expand | farm-radius | farm | tunnel | setup-* | help"
     elseif command ~= "" then
         local accepted, result = handleCommand(command, message.requestId and ("remote-" .. message.requestId))
         output = result or (accepted and "Command accepted." or "Command rejected.")
@@ -630,6 +1043,8 @@ local function handleWorker(sender, message)
     end
     if message.type == "WORKER_HELLO" then
         local existing = controllerState.turtles[sender]
+        local previousEntry = existing and detachedCopy(existing)
+        local previousNextNumber = controllerState.nextTurtleNumber
         local previousStatus = existing and existing.status
         local name = existing and existing.name
         if not name then
@@ -640,9 +1055,19 @@ local function handleWorker(sender, message)
             id = sender, name = name, label = message.label, status = message.status,
             statusDetail = message.statusDetail,
             position = message.position, heading = message.heading, home = message.home,
+            positionVerifiedAt = message.positionVerifiedAt,
+            navigationReady = message.navigationReady,
+            navigationError = message.navigationError,
+            release = message.release,
+            online = true,
             lastSeen = os.epoch("utc"),
         }
-        saveState()
+        if not saveState() then
+            controllerState.turtles[sender] = previousEntry
+            controllerState.nextTurtleNumber = previousNextNumber
+            printError("Worker registration was rejected because controller state could not be saved")
+            return
+        end
         print(("%s online: %s"):format(name, tostring(message.status)))
         if actionableStatuses[message.status] and previousStatus ~= message.status and not message.resync then
             sendWorkerAlert(
@@ -653,21 +1078,94 @@ local function handleWorker(sender, message)
             )
             saveState()
         end
-    elseif message.type then
-        local turtleInfo = controllerState.turtles[sender] or { id = sender }
-        local previousStatus = turtleInfo.status
-        turtleInfo.status = message.status
+    elseif message.type == "WORKER_HEARTBEAT" then
+        local turtleInfo = controllerState.turtles[sender]
+        if not turtleInfo then
+            printError("UNKNOWN_COMPUTER: heartbeat from " .. tostring(sender))
+            rednet.send(sender, {
+                type = "REGISTRATION_REQUIRED", controllerBootId = BOOT_ID,
+            }, JOB_PROTOCOL)
+            return
+        end
+        if message.controllerBootId ~= BOOT_ID or message.heartbeatNonce ~= currentHeartbeatNonce then return end
         turtleInfo.lastSeen = os.epoch("utc")
+        turtleInfo.online = true
+        turtleInfo.status = message.status or turtleInfo.status
+        turtleInfo.release = type(message.release) == "string" and message.release or turtleInfo.release
+        if type(message.position) == "table" then turtleInfo.position = detachedCopy(message.position) end
+        if type(message.heading) == "string" then turtleInfo.heading = message.heading end
+        if type(message.positionVerifiedAt) == "number" then
+            turtleInfo.positionVerifiedAt = message.positionVerifiedAt
+        end
+        if type(message.navigationReady) == "boolean" then
+            turtleInfo.navigationReady = message.navigationReady
+        end
+        for relayId in pairs(activeRelays) do
+            rednet.send(relayId, {
+                type = "TURTLE_UPDATE", controllerBootId = BOOT_ID,
+                turtle = detachedCopy(turtleInfo),
+            }, JOB_PROTOCOL)
+        end
+    elseif message.type then
+        local turtleInfo = controllerState.turtles[sender]
+        if not turtleInfo then
+            printError("UNKNOWN_COMPUTER: message from " .. tostring(sender))
+            rednet.send(sender, {
+                type = "REGISTRATION_REQUIRED", controllerBootId = BOOT_ID,
+            }, JOB_PROTOCOL)
+            return
+        end
+        local previousStatus = turtleInfo.status
+        if type(message.status) == "string" then turtleInfo.status = message.status end
+        if type(message.position) == "table" then turtleInfo.position = detachedCopy(message.position) end
+        if type(message.heading) == "string" then turtleInfo.heading = message.heading end
+        if type(message.positionVerifiedAt) == "number" then
+            turtleInfo.positionVerifiedAt = message.positionVerifiedAt
+        end
+        turtleInfo.lastMessageAt = os.epoch("utc")
+        if type(message.release) == "string" then turtleInfo.release = message.release end
         controllerState.turtles[sender] = turtleInfo
-        local payload = message.payload
+        local rawPayload = message.payload
+        local payload = type(rawPayload) == "table" and rawPayload or {}
+        if message.type == "FARM_MAP" then
+            local mapValue = type(rawPayload) == "table" and rawPayload
+                or message.farmMap or message.map or message.terrain
+            local mapData = type(mapValue) == "table"
+                and (mapValue.farmMap or mapValue.map or mapValue.terrain or mapValue) or nil
+            local sourceDelta = mapData and mapData.delta
+            local candidateKey = mapData and (mapData.farmId or mapData.siteId or mapData.id)
+            local baseRevision = candidateKey and controllerState.farmMaps[candidateKey]
+                and controllerState.farmMaps[candidateKey].revision or 0
+            local farmKey, changed, compacted, storageError = storeFarmMap(mapValue)
+            if storageError then
+                printError(("Terrain report was not acknowledged: %s"):format(tostring(storageError)))
+                return
+            end
+            if changed then
+                for relayId in pairs(activeRelays) do
+                    if not compacted and type(sourceDelta) == "table" and #sourceDelta <= 128 then
+                        sendFarmDelta(relayId, farmKey, controllerState.farmMaps[farmKey], sourceDelta, baseRevision)
+                    else
+                        sendFarmSnapshot(relayId, farmKey)
+                    end
+                end
+                controllerState.farmMaps[farmKey].data.cells = nil
+            end
+        end
         if actionableStatuses[message.status] or message.type == "JOB_FAILED" then
-            turtleInfo.statusDetail = payload and (payload.reason
-                or type(payload.result) == "string" and payload.result) or turtleInfo.statusDetail
+            turtleInfo.statusDetail = payload.reason
+                or type(payload.result) == "string" and payload.result or turtleInfo.statusDetail
         else
             turtleInfo.statusDetail = nil
         end
-        local job = payload and payload.job
-        local reportedJobId = job and job.id or payload and payload.id
+        for relayId in pairs(activeRelays) do
+            rednet.send(relayId, {
+                type = "TURTLE_UPDATE", controllerBootId = BOOT_ID,
+                turtle = detachedCopy(turtleInfo),
+            }, JOB_PROTOCOL)
+        end
+        local job = payload.job
+        local reportedJobId = job and job.id or payload.id
         if reportedJobId then
             controllerState.jobs[reportedJobId] = controllerState.jobs[reportedJobId] or { turtleId = sender }
             local existingStatus = controllerState.jobs[reportedJobId].status
@@ -698,9 +1196,32 @@ local function handleWorker(sender, message)
                 and type(result.farm) == "table" and result.farm.id then
                 controllerState.sites[result.farm.id] = detachedCopy(result.farm)
             end
+            if tracked.type == "FARM_SERVICE" and type(result) == "table" then
+                local _, _, _, storageError = storeFarmMap(
+                    result.farmMap or result.map or result.terrain, reportedJobId
+                )
+                if storageError then
+                    printError(("Farm result was not acknowledged: %s"):format(tostring(storageError)))
+                    return
+                end
+            end
             if tracked.type == "FARM_CROP" and job and job.progress
                 and type(job.progress.discoveredFarm) == "table" and job.progress.discoveredFarm.id then
                 controllerState.sites[job.progress.discoveredFarm.id] = detachedCopy(job.progress.discoveredFarm)
+            end
+        end
+        if (message.type == "CONTROL_ACCEPTED" or message.type == "CONTROL_REJECTED")
+            and payload and type(payload.action) == "string"
+            and payload.action:find("farm_", 1, true) == 1 then
+            local text = ("%s %s: %s"):format(
+                turtleInfo.name or ("turtle-" .. tostring(sender)),
+                payload.action,
+                tostring(payload.reason or (message.type == "CONTROL_ACCEPTED" and "accepted" or "rejected"))
+            )
+            for relayId in pairs(activeRelays) do
+                rednet.send(relayId, {
+                    type = "CONTROL_RESULT", text = text, controllerBootId = BOOT_ID,
+                }, JOB_PROTOCOL)
             end
         end
         local workerName = turtleInfo.name or ("turtle-" .. tostring(sender))
@@ -777,7 +1298,7 @@ if not openModems() then error("Mining controller requires an attached modem", 0
 print(("Mining controller computer %d"):format(os.getComputerID()))
 print("Network: " .. NETWORK_ID)
 showHelp()
-controllerHello()
+controllerHeartbeat()
 
 local announceTimer = os.startTimer(15)
 local input = ""
@@ -801,46 +1322,71 @@ while true do
         input = ""
         write("controller> ")
     elseif event == "timer" and first == announceTimer then
-        controllerHello()
+        expireTurtleLeases()
+        controllerHeartbeat()
         announceTimer = os.startTimer(15)
     elseif event == "rednet_message" and third == JOB_PROTOCOL then
         if type(second) == "table" and second.type == "CONTROLLER_QUERY" then
             controllerHello(first)
         elseif type(second) == "table" and second.type == "RELAY_HELLO"
             and second.source == first and second.controllerBootId == BOOT_ID then
+            local previousRelay = controllerState.relays[first]
             registerRelay(first)
-            saveState()
-            local turtles, sites = completionSnapshot()
-            rednet.send(first, {
-                type = "RELAY_ACK",
-                controllerBootId = BOOT_ID,
-                turtles = turtles,
-                sites = sites,
-            }, JOB_PROTOCOL)
+            if saveState() then
+                local turtles, sites = completionSnapshot()
+                rednet.send(first, {
+                    type = "RELAY_ACK",
+                    controllerBootId = BOOT_ID,
+                    turtles = turtles,
+                    turtleStates = relayTurtleStates(),
+                    sites = sites,
+                    farmMapKeys = farmMapIndex(),
+                }, JOB_PROTOCOL)
+            else
+                controllerState.relays[first] = previousRelay
+                activeRelays[first] = previousRelay and true or nil
+                printError("Relay registration rejected because controller state could not be saved")
+            end
+        elseif type(second) == "table" and second.type == "FARM_MAP_RESYNC_REQUEST"
+            and second.source == first and second.controllerBootId == BOOT_ID
+            and activeRelays[first] and type(second.farmKey) == "string" then
+            sendFarmSnapshot(first, second.farmKey)
         elseif type(second) == "table" and second.type == "ALERT_SYNC_REQUEST"
             and second.source == first and second.controllerBootId == BOOT_ID
             and activeRelays[first] then
+            local previousRelay = controllerState.relays[first]
             registerRelay(first)
-            saveState()
-            rednet.send(first, {
-                type = "ALERT_SYNC",
-                alerts = latestAlerts(10),
-                controllerBootId = BOOT_ID,
-            }, JOB_PROTOCOL)
+            if saveState() then
+                rednet.send(first, {
+                    type = "ALERT_SYNC",
+                    alerts = latestAlerts(10),
+                    controllerBootId = BOOT_ID,
+                }, JOB_PROTOCOL)
+            else
+                controllerState.relays[first] = previousRelay
+                activeRelays[first] = previousRelay and true or nil
+            end
         elseif type(second) == "table" and second.type == "REMOTE_COMMAND" then
             handleRemoteCommand(first, second)
+        elseif type(second) == "table" and second.type == "FARM_ROUTE_REQUEST" then
+            handleFarmRouteRequest(first, second)
+        elseif type(second) == "table" and second.type == "FARM_TERRAIN_REQUEST" then
+            handleFarmTerrainRequest(first, second)
         else
             handleWorker(first, second)
         end
     elseif event == "rednet_message" and third == DEPLOY_PROTOCOL and type(second) == "table"
         and second.type == "UPDATE_AVAILABLE" and second.project == "mining-bot"
         and second.target == "controller" and second.release ~= installedRelease() then
+        os.queueEvent("bucky_deployment_update_ack", second.release)
         print("Controller update available; rebooting into updater.")
         sleep(1)
         os.reboot()
     elseif event == "rednet_message" and third == DEPLOY_PROTOCOL and type(second) == "table"
         and second.type == "UPDATE_AVAILABLE" and second.project == "mining-bot"
-        and second.target == "turtle" and type(second.release) == "string" then
+        and second.target == "turtle" and type(second.release) == "string"
+        and second.release ~= announcedTurtleRelease then
+        announcedTurtleRelease = second.release
         for turtleId in pairs(controllerState.turtles) do
             rednet.send(turtleId, {
                 type = "CONTROL_JOB",
@@ -848,5 +1394,11 @@ while true do
                 release = second.release,
             }, JOB_PROTOCOL)
         end
+    elseif event == "bucky_deployment_update" and type(first) == "string"
+        and first ~= installedRelease() then
+        os.queueEvent("bucky_deployment_update_ack", first)
+        print("Background updater found a controller release; rebooting into updater.")
+        sleep(1)
+        os.reboot()
     end
 end
