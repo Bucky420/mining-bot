@@ -1,16 +1,21 @@
 local now = 1000
 local responses = {}
 local lastSent
+local stateData = { controllerId = 9, controllerBootId = "boot", reportOutbox = {} }
 
 package.preload["config"] = function()
-    return { network = { enabled = true, protocol = "bucky/mining/v1", controllerId = nil } }
+    return {
+        network = {
+            enabled = true, protocol = "bucky/mining/v1",
+            controllerId = nil, maxQueuedReports = 2,
+        },
+    }
 end
 package.preload["lib.inventory"] = function()
     return { ensureModem = function() return true end }
 end
 package.preload["lib.state"] = function()
-    local data = { controllerId = 9, controllerBootId = "boot", reportOutbox = {} }
-    return { get = function() return data end, save = function() end }
+    return { get = function() return stateData end, save = function() end }
 end
 package.preload["lib.util"] = function()
     return {
@@ -86,5 +91,26 @@ responses = {
 }
 local cells, terrainError, terrainRevision = network.requestFarmTerrain("farm", 8)
 assert(cells and not terrainError and terrainRevision == 8 and #cells == 2)
+
+responses = {}
+local reported, reportError = network.report("FARM_MAP", { revision = 9 })
+assert(reported and reportError:find("QUEUED_OFFLINE", 1, true), tostring(reportError))
+assert(#stateData.reportOutbox == 1, "unacknowledged report was dropped")
+responses = {}
+reported, reportError = network.report("FARM_MAP", { revision = 10 })
+assert(not reported and reportError:find("REPORT_BACKLOG_LIMIT_REACHED", 1, true),
+    tostring(reportError))
+assert(network.reportBacklogFull() and #stateData.reportOutbox == 2,
+    "full report backlog did not retain terrain")
+reported, reportError = network.report("JOB_FAILED", {})
+assert(not reported and reportError == "REPORT_BACKLOG_LIMIT_REACHED"
+    and #stateData.reportOutbox == 2, "status report exceeded the bounded terrain backlog")
+responses = {
+    { 9, { type = "REPORT_ACK", messageId = stateData.reportOutbox[1].messageId } },
+    { 9, { type = "REPORT_ACK", messageId = stateData.reportOutbox[2].messageId } },
+}
+reported, reportError = network.flushReports(true)
+assert(reported and not reportError and #stateData.reportOutbox == 0,
+    "queued report was not removed after acknowledgement")
 
 print("network terrain tests passed")

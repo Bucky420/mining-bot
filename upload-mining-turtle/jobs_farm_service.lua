@@ -126,50 +126,6 @@ local function insideNavigationBoundary(progress, x, z)
     return terrain.inRadius(progress.anchor.x, progress.anchor.z, x, z, progress.radius + 3)
 end
 
--- Farm exclusions describe ground suitability, not whether air at cruise height is open.
--- This bounded DFS only follows freshly inspected air and backtracks every rejected branch.
-local function physicalAirRoute(progress, target, continueRoute, maximumVisits)
-    progress.navAllowed = progress.navAllowed or {}
-    local visited, visits = {}, 0
-    local function search()
-        if not continueRoute() then return false, "JOB_CANCELLED" end
-        local current = nav.getPosition()
-        if current.x == target.x and current.z == target.z then return true end
-        local currentKey = ("%d:%d:%d"):format(current.x, current.y, current.z)
-        if visited[currentKey] or visits >= maximumVisits then return false, "AIR_ROUTE_EXHAUSTED" end
-        visited[currentKey], visits = true, visits + 1
-        for _, direction in ipairs(orderedDirections(current, target)) do
-            local vector = vectors[direction]
-            local nextX, nextZ = current.x + vector.x, current.z + vector.z
-            local nextKey = ("%d:%d:%d"):format(nextX, current.y, nextZ)
-            if not visited[nextKey] and insideNavigationBoundary(progress, nextX, nextZ) then
-                local faced, faceError = nav.face(direction)
-                if not faced then return false, faceError end
-                local blocked = turtle.inspect()
-                if not blocked then
-                    local moved, moveError = nav.forward({
-                        shouldContinue = continueRoute,
-                    })
-                    if moved then
-                        progress.navAllowed[key(nextX, nextZ)] = true
-                        local found, routeError = search()
-                        if found then return true end
-                        local returnedFace, returnedFaceError = nav.face(opposite[direction])
-                        if not returnedFace then return false, returnedFaceError end
-                        local returned, returnError = nav.forward()
-                        if not returned then return false, "AIR_ROUTE_BACKTRACK_FAILED: " .. tostring(returnError) end
-                        if routeError == "JOB_CANCELLED" then return false, routeError end
-                    elseif moveError == "JOB_CANCELLED" then
-                        return false, moveError
-                    end
-                end
-            end
-        end
-        return false, "AIR_ROUTE_EXHAUSTED"
-    end
-    return search()
-end
-
 local function riseThroughCanopy(progress, cruiseY, target, continueRoute, maximumVisits)
     local visited, visits = {}, 0
     local options = {
@@ -240,7 +196,7 @@ local function travelCruise(progress, x, y, z, job, framework, ignoreCancellatio
         })
     end
     local cruiseY = progress.baseY + 5
-    if position.y ~= cruiseY then
+    if position.y < cruiseY then
         local raised, raiseError = riseThroughCanopy(
             progress, cruiseY, { x = x, z = z }, options.shouldContinue, 64
         )
@@ -288,9 +244,10 @@ local function travelCruise(progress, x, y, z, job, framework, ignoreCancellatio
             end
         end
         if not crossed then
-            crossed, crossError = physicalAirRoute(
-                progress, { x = x, z = z }, options.shouldContinue, 128
-            )
+            crossed, crossError = nav.overflyXYZ(x, y, z, {
+                shouldContinue = options.shouldContinue,
+                maximumY = cruiseY + config.farming.maxOverflightRise,
+            })
         end
     else
         if progress.farm then
@@ -317,9 +274,10 @@ local function travelCruise(progress, x, y, z, job, framework, ignoreCancellatio
             })
         end
         if not crossed then
-            crossed, crossError = physicalAirRoute(
-                progress, { x = x, z = z }, options.shouldContinue, 128
-            )
+            crossed, crossError = nav.overflyXYZ(x, y, z, {
+                shouldContinue = options.shouldContinue,
+                maximumY = cruiseY + config.farming.maxOverflightRise,
+            })
         end
     end
     if not crossed then return false, crossError or "NO_SAFE_ROUTE_AROUND_BOUNDARY" end
@@ -680,6 +638,16 @@ local function survey(progress, job, framework)
     progress.phase = "SURVEY"
     progress.surfaceColumns = progress.surfaceColumns or {}
     progress.surfaceNames = progress.surfaceNames or {}
+    if network.reportBacklogFull() then
+        local restored, restoreError = inventory.ensureModem()
+        if not restored then
+            return false, "SURVEY_BACKLOG_MODEM_FAILED: " .. tostring(restoreError)
+        end
+        local flushed, flushError = network.flushReports(true)
+        if not flushed then
+            return false, "SURVEY_REPORT_BACKLOG_FULL: " .. tostring(flushError)
+        end
+    end
     if not progress.surveyNavigationReady then
         if next(progress.surfaceColumns) then refreshSurveyNavigation(progress) end
         local initial, initialError = scanner.scan(config.scanner.maxRadius)

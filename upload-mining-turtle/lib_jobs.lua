@@ -142,6 +142,8 @@ function jobs.executeCurrent()
     if job.failureReason:find("NEEDS_GEO_SCANNER", 1, true) then failureStatus = "NEEDS_SCANNER" end
     if job.failureReason:find("NEEDS_FARM", 1, true) then failureStatus = "NEEDS_FARM" end
     if job.failureReason:find("NEEDS_MODEM", 1, true) then failureStatus = "NEEDS_NETWORK" end
+    if job.failureReason:find("REPORT_", 1, true)
+        or job.failureReason:find("NO_CONTROLLER", 1, true) then failureStatus = "NEEDS_NETWORK" end
     state.setStatus(failureStatus, job.failureReason)
     util.log("ERROR", "Job failed", { id = job.id, type = job.type, reason = job.failureReason })
     return false, job.failureReason

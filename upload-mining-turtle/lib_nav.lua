@@ -436,6 +436,50 @@ function nav.gotoXYZ(x, y, z, options)
     return true
 end
 
+function nav.overflyXYZ(x, y, z, options)
+    options = options or {}
+    local maximumY = tonumber(options.maximumY)
+    if not maximumY or maximumY ~= math.floor(maximumY) then
+        return false, "INVALID_OVERFLIGHT_MAXIMUM"
+    end
+    local horizontalOptions = {
+        shouldContinue = options.shouldContinue,
+        routeOrder = { "x", "z" },
+    }
+    local verticalOptions = {
+        shouldContinue = options.shouldContinue,
+        routeOrder = { "y" },
+    }
+    while true do
+        local current = nav.getPosition()
+        local crossed, crossError, block = nav.gotoXYZ(
+            x, current.y, z, horizontalOptions
+        )
+        if crossed then
+            local descended, descendError, descendBlock = nav.gotoXYZ(
+                x, y, z, verticalOptions
+            )
+            if descended then return true end
+            if descendError == "BLOCK" then
+                return false, "OVERFLIGHT_DESTINATION_BLOCKED", descendBlock
+            end
+            return false, descendError, descendBlock
+        end
+        if crossError ~= "BLOCK" then return false, crossError, block end
+        current = nav.getPosition()
+        if current.y >= maximumY then return false, "OVERFLIGHT_LIMIT", block end
+        local raised, raiseError, raiseBlock = nav.up({
+            shouldContinue = options.shouldContinue,
+        })
+        if not raised then
+            if raiseError == "BLOCK" then
+                return false, "OVERFLIGHT_ASCENT_BLOCKED", raiseBlock
+            end
+            return false, raiseError, raiseBlock
+        end
+    end
+end
+
 function nav.directionVector(direction)
     return util.copy(vectors[direction])
 end

@@ -34,6 +34,7 @@ local config = {
         protocol = networkId .. "/mining/v1",
         controllerId = nil,
         receiveTimeout = 1,
+        maxQueuedReports = 16,
     },
 
     profiles = {
@@ -83,6 +84,7 @@ local config = {
     farming = {
         serviceRadius = 32,
         serviceIdleSeconds = 5,
+        maxOverflightRise = 16,
         defaultMatureAge = 7,
         seedReserve = 8,
         minimumDiscoveryDensity = 0.6,

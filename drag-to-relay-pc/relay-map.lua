@@ -17,10 +17,13 @@ local controllerId, controllerBootId, registered
 local farmMaps, snapshots, deltas, turtles = {}, {}, {}, {}
 local playerPosition
 local center = { x = 0, z = 0 }
+local centerInitialized = false
 local zoom, followPlayer = 1, true
 local status = "Finding controller"
 local viewHeading = "north"
 local previousGpsPosition
+local playerHeadingAt
+local playerDetector = peripheral.find("playerDetector") or peripheral.find("player_detector")
 
 local function finiteNumber(value)
     return type(value) == "number" and value == value
@@ -41,15 +44,9 @@ local function worldDelta(screenX, screenY)
     return screenX, screenY
 end
 
-local function headingGlyph(heading)
-    local indexes = { north = 0, east = 1, south = 2, west = 3 }
-    local glyphs = { "^", ">", "v", "<" }
-    if indexes[heading] == nil then return "T" end
-    return glyphs[((indexes[heading] - indexes[viewHeading]) % 4) + 1]
-end
-
 local function updatePlayerGps(x, y, z)
-    if previousGpsPosition then
+    local now = os.epoch("utc")
+    if previousGpsPosition and (not playerHeadingAt or now - playerHeadingAt > 1500) then
         local dx, dz = x - previousGpsPosition.x, z - previousGpsPosition.z
         if math.abs(dx) >= 0.5 or math.abs(dz) >= 0.5 then
             if math.abs(dx) >= math.abs(dz) then viewHeading = dx >= 0 and "east" or "west"
@@ -58,6 +55,66 @@ local function updatePlayerGps(x, y, z)
     end
     previousGpsPosition = { x = x, z = z }
     playerPosition = { x = x, y = y, z = z }
+    centerInitialized = true
+end
+
+local function headingFromYaw(yaw)
+    yaw = yaw % 360
+    if yaw < 45 or yaw >= 315 then return "south" end
+    if yaw < 135 then return "west" end
+    if yaw < 225 then return "north" end
+    return "east"
+end
+
+local function pollPlayerHeading()
+    if not playerDetector then
+        playerDetector = peripheral.find("playerDetector") or peripheral.find("player_detector")
+    end
+    if not playerDetector then return false end
+    local configured = settings.get("bucky.player")
+    local names
+    if type(configured) == "string" and configured ~= "" then
+        names = { configured }
+    else
+        local ok, online = pcall(playerDetector.getOnlinePlayers)
+        if not ok or type(online) ~= "table" then return false end
+        names = online
+    end
+    local selected, selectedDistance
+    for _, name in ipairs(names) do
+        local ok, position = pcall(playerDetector.getPlayerPos, name)
+        if ok and type(position) == "table" and finiteNumber(position.yaw) then
+            local distance = 0
+            if playerPosition and finiteNumber(position.x) and finiteNumber(position.z) then
+                distance = (position.x - playerPosition.x) ^ 2 + (position.z - playerPosition.z) ^ 2
+            elseif #names > 1 then
+                distance = math.huge
+            end
+            if not selectedDistance or distance < selectedDistance then
+                selected, selectedDistance = position, distance
+            end
+        end
+    end
+    if not selected then return false end
+    viewHeading = headingFromYaw(selected.yaw)
+    playerHeadingAt = os.epoch("utc")
+    return true
+end
+
+local function applyControllerPlayer(player)
+    if player == false then
+        playerHeadingAt = nil
+        return false
+    end
+    if type(player) ~= "table" or not finiteNumber(player.x) or not finiteNumber(player.y)
+        or not finiteNumber(player.z) or not finiteNumber(player.yaw) then return false end
+    playerPosition = { x = player.x, y = player.y, z = player.z }
+    previousGpsPosition = { x = player.x, z = player.z }
+    viewHeading = headingFromYaw(player.yaw)
+    playerHeadingAt = os.epoch("utc")
+    centerInitialized = true
+    status = "Controller yaw"
+    return true
 end
 
 local function validCell(cell)
@@ -146,45 +203,135 @@ local function cellCount(exceptKey)
     return count
 end
 
-local function terrainStyle(cell)
+local function terrainColor(cell)
     if cell.occupant then
         if cell.occupant:find("leaves", 1, true) or cell.occupant:find("log", 1, true) then
-            return "^", colors.green
+            return colors.green
         end
-        return "*", colors.lime
+        return colors.lime
     end
     local styles = {
-        water = { "~", colors.blue }, grass = { ",", colors.green },
-        farmland = { "=", colors.brown }, dirt = { ".", colors.brown },
-        sand = { ":", colors.yellow }, stone = { "o", colors.lightGray },
-        tree_log = { "^", colors.green }, tree_leaves = { "^", colors.green },
-        fence = { "#", colors.gray }, hard = { "#", colors.gray },
-        unknown = { "#", colors.gray },
+        water = colors.blue, grass = colors.green,
+        farmland = colors.brown, dirt = colors.orange,
+        sand = colors.yellow, stone = colors.lightGray,
+        tree_log = colors.brown, tree_leaves = colors.lime,
+        fence = colors.gray, hard = colors.gray, unknown = colors.gray,
     }
-    local style = styles[cell.class]
-    return style and style[1] or ".", style and style[2] or colors.lightGray
+    return styles[cell.class] or colors.lightGray
 end
 
-local function draw(x, y, text, foreground)
-    term.setCursorPos(x, y)
-    term.setTextColor(foreground or colors.white)
-    term.setBackgroundColor(colors.black)
-    term.write(text)
+local markerPriority = {
+    [colors.cyan] = 3,
+    [colors.orange] = 2,
+    [colors.red] = 1,
+}
+
+local function encodeTexel(pixels)
+    local counts, firstSeen = {}, {}
+    for index, color in ipairs(pixels) do
+        counts[color] = (counts[color] or 0) + 1
+        firstSeen[color] = firstSeen[color] or index
+    end
+    local background
+    for color, count in pairs(counts) do
+        if not background or count > counts[background]
+            or count == counts[background] and firstSeen[color] < firstSeen[background] then
+            background = color
+        end
+    end
+    local foreground
+    for color in pairs(counts) do
+        if color ~= background and markerPriority[color]
+            and (not foreground or (markerPriority[color] or 0) > (markerPriority[foreground] or 0)) then
+            foreground = color
+        end
+    end
+    if not foreground then
+        for color, count in pairs(counts) do
+            if color ~= background and (not foreground or count > counts[foreground]
+                or count == counts[foreground] and firstSeen[color] < firstSeen[foreground]) then
+                foreground = color
+            end
+        end
+    end
+    if not foreground then
+        local blit = colors.toBlit(background)
+        return " ", blit, blit
+    end
+    local active = {}
+    for index, color in ipairs(pixels) do active[index] = color == foreground end
+    local sixth = active[6]
+    local character = 128
+    for index = 1, 5 do
+        if active[index] ~= sixth then character = character + 2 ^ (index - 1) end
+    end
+    if sixth then foreground, background = background, foreground end
+    return string.char(character), colors.toBlit(foreground), colors.toBlit(background)
+end
+
+local function renderCanvas(canvas, width, height)
+    local characterRows = math.floor(height / 3)
+    for row = 1, characterRows do
+        local characters, foreground, background = {}, {}, {}
+        for column = 1, math.floor(width / 2) do
+            local x, y = column * 2 - 1, row * 3 - 2
+            local character, front, back = encodeTexel({
+                canvas[y][x], canvas[y][x + 1],
+                canvas[y + 1][x], canvas[y + 1][x + 1],
+                canvas[y + 2][x], canvas[y + 2][x + 1],
+            })
+            characters[column], foreground[column], background[column] = character, front, back
+        end
+        term.setCursorPos(1, row)
+        term.blit(table.concat(characters), table.concat(foreground), table.concat(background))
+    end
+end
+
+local function chooseCenter()
+    if followPlayer and playerPosition then
+        center.x, center.z = playerPosition.x, playerPosition.z
+        centerInitialized = true
+        return
+    end
+    if centerInitialized then return end
+    for _, farmMap in pairs(farmMaps) do
+        local farmCenter = farmMap.data and farmMap.data.center
+        if farmCenter then
+            center.x, center.z = farmCenter.x, farmCenter.z
+            centerInitialized = true
+            return
+        end
+    end
+    for _, turtleInfo in pairs(turtles) do
+        if turtleInfo.position then
+            center.x, center.z = turtleInfo.position.x, turtleInfo.position.z
+            centerInitialized = true
+            return
+        end
+    end
 end
 
 local function render()
     local width, height = term.getSize()
-    term.setBackgroundColor(colors.black)
-    term.clear()
-    if followPlayer and playerPosition then center.x, center.z = playerPosition.x, playerPosition.z end
+    local pixelWidth, pixelHeight = width * 2, (height - 1) * 3
+    local canvas = {}
+    for y = 1, pixelHeight do
+        canvas[y] = {}
+        for x = 1, pixelWidth do canvas[y][x] = colors.black end
+    end
+    local function drawPixel(x, y, color)
+        if x >= 1 and x <= pixelWidth and y >= 1 and y <= pixelHeight then
+            canvas[y][x] = color
+        end
+    end
+    chooseCenter()
     for _, farmMap in pairs(farmMaps) do
         for _, cell in pairs(farmMap.data and farmMap.data.cells or {}) do
             local viewX, viewY = viewDelta(cell.x - center.x, cell.z - center.z)
-            local x = math.floor(viewX / zoom + width / 2 + 0.5)
-            local y = math.floor(viewY / zoom + (height - 1) / 2 + 0.5)
-            if x >= 1 and x <= width and y >= 1 and y < height then
-                local glyph, color = terrainStyle(cell)
-                draw(x, y, glyph, color)
+            local x = math.floor(viewX / zoom + pixelWidth / 2 + 0.5)
+            local y = math.floor(viewY / zoom + pixelHeight / 2 + 0.5)
+            if x >= 1 and x <= pixelWidth and y >= 1 and y <= pixelHeight then
+                drawPixel(x, y, terrainColor(cell))
             end
         end
     end
@@ -199,24 +346,27 @@ local function render()
                 nearestName, nearestDistance = turtleInfo.name or ("T" .. tostring(turtleInfo.id)), distance
             end
             local viewX, viewY = viewDelta(position.x - center.x, position.z - center.z)
-            local rawX = math.floor(viewX / zoom + width / 2 + 0.5)
-            local rawY = math.floor(viewY / zoom + (height - 1) / 2 + 0.5)
-            local onScreen = rawX >= 1 and rawX <= width and rawY >= 1 and rawY < height
-            local x = math.max(1, math.min(width, rawX))
-            local y = math.max(1, math.min(height - 1, rawY))
+            local rawX = math.floor(viewX / zoom + pixelWidth / 2 + 0.5)
+            local rawY = math.floor(viewY / zoom + pixelHeight / 2 + 0.5)
+            local onScreen = rawX >= 1 and rawX <= pixelWidth and rawY >= 1 and rawY <= pixelHeight
+            local x = math.max(1, math.min(pixelWidth, rawX))
+            local y = math.max(1, math.min(pixelHeight, rawY))
             local stale = turtleInfo.lastSeen and os.epoch("utc") - turtleInfo.lastSeen > 60000
-            draw(x, y, onScreen and headingGlyph(turtleInfo.heading) or "!",
-                stale and colors.lightGray or colors.orange)
+            drawPixel(x, y, stale and colors.lightGray or onScreen and colors.orange or colors.red)
         end
     end
     if playerPosition then
         local viewX, viewY = viewDelta(playerPosition.x - center.x, playerPosition.z - center.z)
-        local x = math.floor(viewX / zoom + width / 2 + 0.5)
-        local y = math.floor(viewY / zoom + (height - 1) / 2 + 0.5)
-        if x >= 1 and x <= width and y >= 1 and y < height then draw(x, y, "@", colors.cyan) end
+        local x = math.floor(viewX / zoom + pixelWidth / 2 + 0.5)
+        local y = math.floor(viewY / zoom + pixelHeight / 2 + 0.5)
+        if x >= 1 and x <= pixelWidth and y >= 1 and y <= pixelHeight then
+            drawPixel(x, y, colors.cyan)
+        end
     end
+    renderCanvas(canvas, pixelWidth, pixelHeight)
+    local mode = followPlayer and (playerPosition and "GPS" or "AUTO") or "PAN"
     local footer = ("%s z%d UP:%s %d,%d"):format(
-        followPlayer and "GPS" or "PAN", zoom, viewHeading:sub(1, 1):upper(),
+        mode, zoom, viewHeading:sub(1, 1):upper(),
         math.floor(center.x), math.floor(center.z)
     )
     if nearestName then footer = footer .. (" %s:%d"):format(nearestName, nearestDistance) end
@@ -335,6 +485,7 @@ local function handleController(sender, message)
         controllerId, controllerBootId = sender, message.bootId
         if changed then farmMaps, snapshots, deltas, registered = {}, {}, {}, false end
         if type(message.turtleStates) == "table" then turtles = copyTurtles(message.turtleStates) end
+        if message.player ~= nil then applyControllerPlayer(message.player) end
         if not registered then
             rednet.send(sender, {
                 type = "RELAY_HELLO", source = os.getComputerID(), controllerBootId = controllerBootId,
@@ -346,7 +497,11 @@ local function handleController(sender, message)
         and message.controllerBootId == controllerBootId then
         registered = true
         if type(message.turtleStates) == "table" then turtles = copyTurtles(message.turtleStates) end
+        if message.player ~= nil then applyControllerPlayer(message.player) end
         applyIndex(message.farmMapKeys)
+    elseif message.type == "PLAYER_UPDATE" and sender == controllerId
+        and message.controllerBootId == controllerBootId then
+        applyControllerPlayer(message.player)
     elseif message.type == "TURTLE_UPDATE" and sender == controllerId
         and message.controllerBootId == controllerBootId and type(message.turtle) == "table"
         and message.turtle.id then
@@ -408,11 +563,13 @@ while true do
         local x, y, z = gps.locate(0.2, false)
         if x then
             updatePlayerGps(x, y, z)
-            status = "GPS locked"
+            local headingFresh = playerHeadingAt and os.epoch("utc") - playerHeadingAt <= 1500
+            status = headingFresh and "GPS + yaw" or "GPS locked"
         else
             status = "GPS unavailable"
         end
-        gpsTimer = os.startTimer(2)
+        if pollPlayerHeading() then status = x and "GPS + yaw" or "Yaw detected" end
+        gpsTimer = os.startTimer(0.5)
     elseif event == "timer" and first == queryTimer then
         rednet.broadcast({ type = "CONTROLLER_QUERY", source = os.getComputerID() }, JOB_PROTOCOL)
         queryTimer = os.startTimer(10)
@@ -420,16 +577,24 @@ while true do
         -- Redrawn below.
     elseif event == "key" and first == keys.left then
         local dx, dz = worldDelta(-zoom * 2, 0)
-        followPlayer, center.x, center.z = false, center.x + dx, center.z + dz
+        followPlayer, centerInitialized, center.x, center.z = false, true, center.x + dx, center.z + dz
     elseif event == "key" and first == keys.right then
         local dx, dz = worldDelta(zoom * 2, 0)
-        followPlayer, center.x, center.z = false, center.x + dx, center.z + dz
+        followPlayer, centerInitialized, center.x, center.z = false, true, center.x + dx, center.z + dz
     elseif event == "key" and first == keys.up then
         local dx, dz = worldDelta(0, -zoom * 2)
-        followPlayer, center.x, center.z = false, center.x + dx, center.z + dz
+        followPlayer, centerInitialized, center.x, center.z = false, true, center.x + dx, center.z + dz
     elseif event == "key" and first == keys.down then
         local dx, dz = worldDelta(0, zoom * 2)
-        followPlayer, center.x, center.z = false, center.x + dx, center.z + dz
+        followPlayer, centerInitialized, center.x, center.z = false, true, center.x + dx, center.z + dz
+    elseif event == "key" and first == keys.pageUp then
+        zoom = math.max(1, math.floor(zoom / 2))
+    elseif event == "key" and first == keys.pageDown then
+        zoom = math.min(16, zoom * 2)
+    elseif event == "key" and first == keys.space then
+        followPlayer = true
+        centerInitialized = false
+        chooseCenter()
     elseif event == "char" and (first == "+" or first == "=") then
         zoom = math.max(1, math.floor(zoom / 2))
     elseif event == "char" and first == "-" then

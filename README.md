@@ -31,6 +31,14 @@ overwrite worker state.
 5. Optionally, drag all files from `drag-to-relay-pc/` onto an advanced pocket
    computer, then reboot it.
 
+Running relays recognize `relay-manifest.lua` as a local self-update package.
+Dragging all files from `drag-to-relay-pc/` onto an active relay stages and
+validates every manifest entry, installs it with rollback data, and reboots the
+Pocket automatically. Relays installed before the manifest updater require the
+same package to be dragged twice once: the first drag updates the updater, and
+the second installs the complete package. Later updates require one drag per
+Pocket, including when new files are added to the manifest.
+
 The bootstrap detects whether it is running on a computer or turtle and
 installs the correct target. Updates are staged, validated, and resumed from
 checkpoints. `/data` state and maps are never distributed.
@@ -141,11 +149,26 @@ travel direction is at the top; `UP:N`, `UP:E`, `UP:S`, or `UP:W` in the footer
 shows the corresponding world direction.
 
 - Arrow keys pan and disable player follow.
-- `+`, `-`, or the mouse wheel change zoom.
-- Press `F` to toggle player following.
-- Orange arrows are turtles, `@` is the player, and `!` marks an off-screen
-  turtle at the nearest map edge.
+- `Page Up` zooms in and `Page Down` zooms out.
+- Press `Space` to center on the player and restore following.
+- The native Pocket map uses CC:Tweaked 2-by-3 semigraphics for six square map
+  pixels per terminal character.
+- Cyan pixels mark the player, orange pixels mark turtles, and red edge pixels
+  mark off-screen turtles.
 - Click the native `Command` tab to return to commands.
+
+GPS reports movement but not stationary head direction. For live yaw, connect an
+Advanced Peripherals Player Detector directly to the mining controller PC or to
+its connected wired-modem network. Configure the tracked Minecraft name on that
+controller before rebooting it:
+
+```text
+set bucky.player PlayerName
+```
+
+The controller sends only that player's validated position and yaw to registered
+relays. If no name is configured, it automatically tracks the player only when
+exactly one player is online. The Pocket keeps its wireless modem equipped.
 
 Terrain snapshots are transferred in bounded chunks and kept only in pocket
 memory. Reconnecting to the controller rebuilds the map without growing the

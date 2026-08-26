@@ -4,26 +4,40 @@ colors = {
     pink = 64, gray = 128, lightGray = 256, cyan = 512, purple = 1024,
     blue = 2048, brown = 4096, green = 8192, red = 16384, black = 32768,
 }
+function colors.toBlit(color)
+    for index = 0, 15 do if color == 2 ^ index then return ("%x"):format(index) end end
+end
 keys = {
     backspace = 14, tab = 15, enter = 28, left = 203, right = 205,
-    up = 200, down = 208,
+    up = 200, down = 208, pageUp = 201, pageDown = 209, space = 57,
 }
 
 local writes = {}
 local function terminal()
     local cursorX, cursorY = 1, 1
+    local foreground, background = colors.white, colors.black
     local object = {}
     function object.getSize() return 26, 20 end
     function object.setCursorPos(x, y) cursorX, cursorY = x, y end
     function object.getCursorPos() return cursorX, cursorY end
-    function object.setTextColor() end
-    function object.setBackgroundColor() end
+    function object.setTextColor(color) foreground = color end
+    function object.setBackgroundColor(color) background = color end
     function object.clear() end
     function object.clearLine() end
     function object.scroll() end
     function object.write(text)
-        writes[#writes + 1] = { x = cursorX, y = cursorY, text = tostring(text) }
+        writes[#writes + 1] = {
+            x = cursorX, y = cursorY, text = tostring(text),
+            foreground = foreground, background = background,
+        }
         cursorX = cursorX + #tostring(text)
+    end
+    function object.blit(text, foregroundColors, backgroundColors)
+        writes[#writes + 1] = {
+            x = cursorX, y = cursorY, text = text,
+            foreground = foregroundColors, background = backgroundColors, blit = true,
+        }
+        cursorX = cursorX + #text
     end
     function object.setVisible() end
     return object
@@ -40,6 +54,9 @@ term = {
     clear = function() return current.clear() end,
     clearLine = function() return current.clearLine() end,
     write = function(value) return current.write(value) end,
+    blit = function(text, foreground, background)
+        return current.blit(text, foreground, background)
+    end,
     setTextColor = function(color) return current.setTextColor(color) end,
     setBackgroundColor = function(color) return current.setBackgroundColor(color) end,
 }
@@ -47,20 +64,45 @@ window = { create = function() return terminal() end }
 write = function(value) current.write(value) end
 printError = function(value) current.write(tostring(value)) end
 
+local virtualFiles = {
+    ["/startup.lua"] = "old startup",
+    ["/relay.lua"] = "old relay",
+    ["/relay-map.lua"] = "old map",
+}
 fs = {
-    exists = function() return false end,
+    exists = function(path) return virtualFiles[path] ~= nil end,
     isDir = function() return false end,
-    open = function()
-        return { write = function() end, readAll = function() return "" end, close = function() end }
+    open = function(path, mode)
+        if mode == "r" then
+            if virtualFiles[path] == nil then return nil end
+            return { readAll = function() return virtualFiles[path] end, close = function() end }
+        end
+        local buffer = ""
+        return {
+            write = function(value) buffer = buffer .. tostring(value) end,
+            readAll = function() return virtualFiles[path] or "" end,
+            close = function() virtualFiles[path] = buffer end,
+        }
     end,
-    delete = function() end,
-    copy = function() end,
-    move = function() end,
+    delete = function(path)
+        virtualFiles[path] = nil
+        for name in pairs(virtualFiles) do
+            if name:sub(1, #path + 1) == path .. "/" then virtualFiles[name] = nil end
+        end
+    end,
+    copy = function(source, destination)
+        assert(virtualFiles[source] ~= nil, "missing copy source " .. source)
+        virtualFiles[destination] = virtualFiles[source]
+    end,
+    move = function(source, destination)
+        assert(virtualFiles[source] ~= nil, "missing move source " .. source)
+        virtualFiles[destination], virtualFiles[source] = virtualFiles[source], nil
+    end,
     makeDir = function() end,
     list = function() return {} end,
     combine = function(a, b) return tostring(a) .. "/" .. tostring(b) end,
-    getDir = function() return "" end,
-    getName = function(path) return path end,
+    getDir = function(path) return path:match("^(.*)/[^/]+$") or "" end,
+    getName = function(path) return path:match("([^/]+)$") or path end,
 }
 textutils = {
     serialize = function() return "{}" end,
@@ -89,6 +131,29 @@ sleep = function() end
 
 local realOs = os
 local timerId = 0
+local relayPackage = {
+    ["startup.lua"] = "return true",
+    ["relay.lua"] = "return true",
+    ["relay-map.lua"] = "return true",
+    ["relay-manifest.lua"] = [[return {version=1,files={
+        {source="startup.lua",path="startup.lua"},
+        {source="relay.lua",path="relay.lua"},
+        {source="relay-map.lua",path="relay-map.lua"},
+        {source="relay-manifest.lua",path="relay-manifest.lua"},
+    }}]],
+}
+local transfer = { getFiles = function()
+    local result = {}
+    for name, contents in pairs(relayPackage) do
+        local fileName, fileContents = name, contents
+        result[#result + 1] = {
+            getName = function() return fileName end,
+            readAll = function() return fileContents end,
+            close = function() end,
+        }
+    end
+    return result
+end }
 local events = {
     { "rednet_message", 9, {
         type = "CONTROLLER_HELLO", controllerId = 9, bootId = "boot",
@@ -127,8 +192,13 @@ local events = {
         turtle = { id = 12, name = "worker", heading = "east", lastSeen = 1000,
             position = { x = 2, y = 70, z = 0 } },
     }, "bucky/mining/v1" },
+    { "rednet_message", 9, {
+        type = "PLAYER_UPDATE", controllerBootId = "boot",
+        player = { name = "BIGT", x = 0, y = 70, z = 0, yaw = -90 },
+    }, "bucky/mining/v1" },
     { "mouse_click", 1, 8, 1 },
     { "timer", 2 },
+    { "file_transfer", transfer },
 }
 local eventIndex = 0
 os = setmetatable({
@@ -141,10 +211,15 @@ os = setmetatable({
         if not event then error("STOP_RELAY_TEST", 0) end
         return table.unpack(event)
     end,
+    reboot = function() error("SELF_UPDATE_REBOOT", 0) end,
 }, { __index = realOs })
 
 local ok, loadError = pcall(assert(loadfile("drag-to-relay-pc/relay.lua")))
-assert(not ok and tostring(loadError):find("STOP_RELAY_TEST", 1, true), tostring(loadError))
+assert(not ok and tostring(loadError):find("SELF_UPDATE_REBOOT", 1, true), tostring(loadError))
+for name, contents in pairs(relayPackage) do
+    assert(virtualFiles["/" .. name] == contents, "self-update did not install " .. name)
+end
+assert(not virtualFiles["/.relay-self-update/installing"], "self-update marker was not cleaned")
 
 local requestedMap = false
 for _, packet in ipairs(sent) do
@@ -154,25 +229,22 @@ for _, packet in ipairs(sent) do
 end
 assert(requestedMap, "relay did not request the indexed farm map")
 
-local renderedPlayer = false
-local renderedWater = false
-local renderedTurtle = false
+local renderedPlayer, renderedWater, renderedTurtle = false, false, false
+local renderedEastUp = false
 for _, entry in ipairs(writes) do
-    if entry.text == "@" then renderedPlayer = true end
-    if entry.text == "~" then renderedWater = true end
-    if entry.text == ">" then renderedTurtle = true end
+    if entry.text == " " and entry.background == colors.cyan then renderedPlayer = true end
+    if entry.text == " " and entry.background == colors.blue then renderedWater = true end
+    if entry.text == " " and entry.background == colors.orange then renderedTurtle = true end
+    if entry.text:find("UP:E", 1, true) then renderedEastUp = true end
 end
-assert(renderedPlayer, "map tab did not render the followed GPS player")
-assert(renderedWater, "map tab did not render a live terrain delta")
-assert(renderedTurtle, "map tab did not render a live turtle heading")
+assert(renderedPlayer, "map tab did not render the followed GPS player pixel")
+assert(renderedWater, "map tab did not render a live terrain pixel")
+assert(renderedTurtle, "map tab did not render a live turtle pixel")
+assert(renderedEastUp, "map tab did not use controller Player Detector yaw")
 
 writes, sent, eventIndex, timerId, current = {}, {}, 0, 0, native
-local gpsCalls = 0
-gps.locate = function()
-    gpsCalls = gpsCalls + 1
-    if gpsCalls == 1 then return 0, 70, 0 end
-    return 1, 70, 0
-end
+gps.locate = function() return nil end
+peripheral.find = function() return nil end
 events = {
     { "rednet_message", 9, {
         type = "CONTROLLER_HELLO", controllerId = 9, bootId = "boot-map",
@@ -186,12 +258,12 @@ events = {
     { "rednet_message", 9, {
         type = "FARM_MAP_SNAPSHOT_BEGIN", controllerBootId = "boot-map", farmKey = "farm",
         snapshotId = "map-snapshot", mapRevision = 1, chunkCount = 1, cellCount = 1,
-        metadata = { center = { x = 0, y = 69, z = 0 } },
+        metadata = { center = { x = 88582, y = 69, z = 73676 } },
     }, "bucky/mining/v1" },
     { "rednet_message", 9, {
         type = "FARM_MAP_SNAPSHOT_CHUNK", controllerBootId = "boot-map", farmKey = "farm",
         snapshotId = "map-snapshot", chunkIndex = 1, chunkCount = 1,
-        cells = { { x = 1, y = 69, z = 0, name = "minecraft:water", class = "water" } },
+        cells = { { x = 88583, y = 69, z = 73676, name = "minecraft:water", class = "water" } },
     }, "bucky/mining/v1" },
     { "rednet_message", 9, {
         type = "FARM_MAP_SNAPSHOT_END", controllerBootId = "boot-map", farmKey = "farm",
@@ -200,26 +272,35 @@ events = {
     { "rednet_message", 9, {
         type = "TURTLE_UPDATE", controllerBootId = "boot-map",
         turtle = { id = 12, name = "worker", heading = "east", lastSeen = 1000,
-            position = { x = 2, y = 70, z = 0 } },
+            position = { x = 88584, y = 70, z = 73676 } },
+    }, "bucky/mining/v1" },
+    { "rednet_message", 9, {
+        type = "PLAYER_UPDATE", controllerBootId = "boot-map",
+        player = { name = "BIGT", x = 88582, y = 70, z = 73676, yaw = -90 },
     }, "bucky/mining/v1" },
     { "timer", 1 },
     { "timer", 3 },
+    { "key", keys.pageDown },
+    { "key", keys.pageUp },
+    { "key", keys.left },
+    { "key", keys.space },
 }
 
 ok, loadError = pcall(assert(loadfile("drag-to-relay-pc/relay-map.lua")))
 assert(not ok and tostring(loadError):find("STOP_RELAY_TEST", 1, true), tostring(loadError))
-local renderedHeadingUp = false
-renderedPlayer, renderedWater, renderedTurtle = false, false, false
+renderedWater, renderedTurtle, renderedEastUp = false, false, false
+local waterBlit = colors.toBlit(colors.blue)
+local turtleBlit = colors.toBlit(colors.orange)
 for _, entry in ipairs(writes) do
-    if entry.text == "@" then renderedPlayer = true end
-    if entry.text == "~" then renderedWater = true end
-    if entry.text == ">" then renderedTurtle = true end
-    if entry.text == "^" then renderedHeadingUp = true end
+    if entry.blit and (entry.foreground:find(waterBlit, 1, true)
+        or entry.background:find(waterBlit, 1, true)) then renderedWater = true end
+    if entry.blit and (entry.foreground:find(turtleBlit, 1, true)
+        or entry.background:find(turtleBlit, 1, true)) then renderedTurtle = true end
+    if entry.text:find("UP:E", 1, true) then renderedEastUp = true end
 end
-assert(renderedPlayer, "native map did not render the pocket GPS position")
-assert(renderedWater, "native map did not render synced terrain")
-assert(renderedTurtle, "native map did not render the turtle heading")
-assert(renderedHeadingUp, "native map did not rotate eastward travel to screen-up")
+assert(renderedWater, "native map did not center and render terrain without GPS")
+assert(renderedTurtle, "native map did not center and render the turtle without GPS")
+assert(renderedEastUp, "native map did not use Player Detector yaw")
 
 local titles, focused, openedProgram, openedArgument = {}, nil, nil, nil
 shell = {

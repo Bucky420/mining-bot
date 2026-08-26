@@ -649,6 +649,50 @@ local function waitForAssignment()
     return handle(tokenize(line))
 end
 
+local function waitForWorkerUpdate(timeout)
+    local release
+    parallel.waitForAny(
+        function() sleep(timeout) end,
+        function()
+            while not release do
+                local _, candidate = os.pullEvent("bucky_deployment_update")
+                if network.needsRelease(candidate) then release = candidate end
+            end
+        end,
+        function()
+            while not release do
+                local available, candidate = network.receiveDeploymentUpdate(1)
+                if available and network.needsRelease(candidate) then release = candidate
+                else sleep(0.25) end
+            end
+        end,
+        function()
+            while not release do
+                local _, _, _, control, candidate = network.receiveJob(1, true)
+                if control == "update" and network.needsRelease(candidate) then
+                    release = candidate
+                else
+                    sleep(0.25)
+                end
+            end
+        end
+    )
+    if release then os.queueEvent("bucky_deployment_update_ack", release) end
+    return release
+end
+
+local function rebootForWaitingUpdate(release)
+    state.setStatus("UPDATE_PENDING", "Failed job accepted an update while waiting to retry")
+    network.report("WORKER_UPDATING", {
+        result = "Update accepted during automatic retry wait; rebooting now",
+        release = release,
+        job = state.get().currentJob,
+    })
+    print("Worker update received during retry wait; rebooting now.")
+    sleep(1)
+    os.reboot()
+end
+
 local function runActiveJob(suppressInput)
     local success, result
     local updateRequested = false
@@ -754,7 +798,14 @@ local function runActiveJob(suppressInput)
         end,
         function()
             while jobExecuting and not updateRequested do
-                local _, release = os.pullEvent("bucky_deployment_update")
+                local release
+                parallel.waitForAny(
+                    function()
+                        local _, availableRelease = os.pullEvent("bucky_deployment_update")
+                        release = availableRelease
+                    end,
+                    function() os.pullEvent("mining_job_finished") end
+                )
                 if network.needsRelease(release) then
                     os.queueEvent("bucky_deployment_update_ack", release)
                     updateRequested = true
@@ -829,7 +880,8 @@ while running do
         end
         if not success and result ~= "JOB_CANCELLED" and state.get().autoRetry then
             print("Job failed; automatic retry is enabled. Retrying in " .. tostring(config.jobs.retryDelay) .. " seconds.")
-            sleep(config.jobs.retryDelay)
+            local updateRelease = waitForWorkerUpdate(config.jobs.retryDelay)
+            if updateRelease then rebootForWaitingUpdate(updateRelease) end
             jobs.retryFailed()
         end
         if #arguments > 0 then break end

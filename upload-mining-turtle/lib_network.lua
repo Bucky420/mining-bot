@@ -90,10 +90,21 @@ function network.open()
     return openModems()
 end
 
+local function reportLimit()
+    return math.max(1, math.floor(tonumber(config.network.maxQueuedReports) or 16))
+end
+
+function network.reportBacklogFull()
+    return #state.get().reportOutbox >= reportLimit()
+end
+
 function network.report(eventType, payload)
     local data = state.get()
     local controllerId = data.controllerId or config.network.controllerId
     if not controllerId then return false, "NO_CONTROLLER_CONFIGURED" end
+    if eventType ~= "FARM_MAP" and network.reportBacklogFull() then
+        return false, "REPORT_BACKLOG_LIMIT_REACHED"
+    end
     local sequence = data.nextReportSequence or 1
     data.nextReportSequence = sequence + 1
     local message = {
@@ -112,7 +123,14 @@ function network.report(eventType, payload)
     }
     table.insert(data.reportOutbox, message)
     state.save()
-    return network.flushReports(true)
+    local flushed, flushError = network.flushReports(true)
+    if flushed then return true end
+    if network.reportBacklogFull() then
+        return false, ("REPORT_BACKLOG_LIMIT_REACHED: %d/%d (%s)"):format(
+            #data.reportOutbox, reportLimit(), tostring(flushError)
+        )
+    end
+    return true, "QUEUED_OFFLINE: " .. tostring(flushError)
 end
 
 function network.flushReports(attachedOnly)
@@ -122,11 +140,13 @@ function network.flushReports(attachedOnly)
     if not ok then return false, openError end
     local pending = {}
     for _, message in ipairs(state.get().reportOutbox) do table.insert(pending, message) end
+    local sendError
     for _, message in ipairs(pending) do
-        local sent = sendReport(controllerId, message)
-        if not sent then break end
+        local sent, reportError = sendReport(controllerId, message)
+        if not sent then sendError = reportError break end
     end
-    return #state.get().reportOutbox == 0
+    if #state.get().reportOutbox == 0 then return true end
+    return false, sendError or "REPORT_OUTBOX_NOT_ACKNOWLEDGED"
 end
 
 function network.announce(resync, attachedOnly)

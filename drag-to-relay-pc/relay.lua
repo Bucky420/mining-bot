@@ -437,6 +437,7 @@ local mapMessage = "Waiting for map data"
 local gpsTimer
 local viewHeading = "north"
 local previousGpsPosition
+local playerHeadingAt
 
 local function terminalSize()
     if baseTerminal then return baseTerminal.getSize() end
@@ -462,15 +463,22 @@ local function worldDelta(screenX, screenY)
     return screenX, screenY
 end
 
-local function headingGlyph(heading)
-    local indexes = { north = 0, east = 1, south = 2, west = 3 }
-    local glyphs = { "^", ">", "v", "<" }
-    if indexes[heading] == nil then return "T" end
-    return glyphs[((indexes[heading] - indexes[viewHeading]) % 4) + 1]
+local function headingFromYaw(yaw)
+    yaw = yaw % 360
+    if yaw < 45 or yaw >= 315 then return "south" end
+    if yaw < 135 then return "west" end
+    if yaw < 225 then return "north" end
+    return "east"
+end
+
+local function finitePlayerNumber(value)
+    return type(value) == "number" and value == value
+        and value > -math.huge and value < math.huge
 end
 
 local function updatePlayerGps(x, y, z)
-    if previousGpsPosition then
+    local now = os.epoch("utc")
+    if previousGpsPosition and (not playerHeadingAt or now - playerHeadingAt > 1500) then
         local dx, dz = x - previousGpsPosition.x, z - previousGpsPosition.z
         if math.abs(dx) >= 0.5 or math.abs(dz) >= 0.5 then
             if math.abs(dx) >= math.abs(dz) then viewHeading = dx >= 0 and "east" or "west"
@@ -481,23 +489,41 @@ local function updatePlayerGps(x, y, z)
     playerPosition = { x = x, y = y, z = z, at = os.epoch("utc") }
 end
 
-local function terrainStyle(cell)
+local function applyControllerPlayer(player)
+    if player == false then
+        playerHeadingAt = nil
+        return false
+    end
+    if type(player) ~= "table" or not finitePlayerNumber(player.x)
+        or not finitePlayerNumber(player.y) or not finitePlayerNumber(player.z)
+        or not finitePlayerNumber(player.yaw) then return false end
+    playerPosition = { x = player.x, y = player.y, z = player.z, at = os.epoch("utc") }
+    previousGpsPosition = { x = player.x, z = player.z }
+    viewHeading = headingFromYaw(player.yaw)
+    playerHeadingAt = os.epoch("utc")
+    if relayState.ui.followPlayer then mapCenter.x, mapCenter.z = player.x, player.z end
+    mapMessage = "Controller yaw"
+    return true
+end
+
+local function terrainColor(cell)
     local class = cell.class
     if cell.occupant then
         if cell.occupant:find("leaves", 1, true) or cell.occupant:find("log", 1, true) then
-            return "^", colors.green
+            return colors.green
         end
-        return "*", colors.lime
+        return colors.lime
     end
-    if class == "water" then return "~", colors.blue end
-    if class == "grass" then return ",", colors.green end
-    if class == "farmland" then return "=", colors.brown end
-    if class == "dirt" then return ".", colors.brown end
-    if class == "sand" then return ":", colors.yellow end
-    if class == "stone" then return "o", colors.lightGray end
-    if class == "tree_log" or class == "tree_leaves" then return "^", colors.green end
-    if class == "fence" or class == "hard" or class == "unknown" then return "#", colors.gray end
-    return ".", colors.lightGray
+    if class == "water" then return colors.blue end
+    if class == "grass" then return colors.green end
+    if class == "farmland" then return colors.brown end
+    if class == "dirt" then return colors.orange end
+    if class == "sand" then return colors.yellow end
+    if class == "stone" then return colors.lightGray end
+    if class == "tree_log" then return colors.brown end
+    if class == "tree_leaves" then return colors.lime end
+    if class == "fence" or class == "hard" or class == "unknown" then return colors.gray end
+    return colors.lightGray
 end
 
 local function writeBase(x, y, text, foreground, background)
@@ -508,6 +534,10 @@ local function writeBase(x, y, text, foreground, background)
     baseTerminal.write(text)
     baseTerminal.setTextColor(colors.white)
     baseTerminal.setBackgroundColor(colors.black)
+end
+
+local function writePixelBase(x, y, color)
+    writeBase(x, y, " ", colors.white, color)
 end
 
 local function drawTabHeader()
@@ -566,8 +596,7 @@ local function renderMap()
             local screenX = math.floor(viewX / zoom + width / 2 + 0.5)
             local screenY = math.floor(viewY / zoom + contentHeight / 2 + top)
             if screenX >= 1 and screenX <= width and screenY >= top and screenY <= bottom then
-                local glyph, color = terrainStyle(cell)
-                writeBase(screenX, screenY, glyph, color, colors.black)
+                writePixelBase(screenX, screenY, terrainColor(cell))
             end
         end
     end
@@ -589,8 +618,8 @@ local function renderMap()
             local screenY = math.max(top, math.min(bottom, rawY))
             local stale = turtleInfo.lastSeen
                 and os.epoch("utc") - turtleInfo.lastSeen > 60000
-            writeBase(screenX, screenY, onScreen and headingGlyph(turtleInfo.heading) or "!",
-                stale and colors.lightGray or colors.orange, colors.black)
+            writePixelBase(screenX, screenY,
+                stale and colors.lightGray or onScreen and colors.orange or colors.red)
         end
     end
     if playerPosition then
@@ -598,7 +627,7 @@ local function renderMap()
         local screenX = math.floor(viewX / zoom + width / 2 + 0.5)
         local screenY = math.floor(viewY / zoom + contentHeight / 2 + top)
         if screenX >= 1 and screenX <= width and screenY >= top and screenY <= bottom then
-            writeBase(screenX, screenY, "@", colors.cyan, colors.black)
+            writePixelBase(screenX, screenY, colors.cyan)
         end
     end
     local status = ("%s z%d UP:%s %d,%d"):format(
@@ -1005,7 +1034,7 @@ end
 
 local function handleControllerMessage(sender, message)
     if type(message) ~= "table" then return end
-    if NATIVE_TABS and (message.type == "TURTLE_UPDATE"
+    if NATIVE_TABS and (message.type == "PLAYER_UPDATE" or message.type == "TURTLE_UPDATE"
         or tostring(message.type):find("^FARM_MAP_")) then return end
     if message.type == "CONTROLLER_HELLO" then
         if message.controllerId ~= sender then return end
@@ -1029,6 +1058,7 @@ local function handleControllerMessage(sender, message)
         if not NATIVE_TABS and type(message.turtleStates) == "table" then
             turtleStates = safeTurtleStates(message.turtleStates)
         end
+        if not NATIVE_TABS and message.player ~= nil then applyControllerPlayer(message.player) end
         if changed then controllerRegistered = false end
         if changed then
             printAsync(("Mining controller connected (computer %d)"):format(sender), false)
@@ -1049,6 +1079,7 @@ local function handleControllerMessage(sender, message)
         if not NATIVE_TABS and type(message.turtleStates) == "table" then
             turtleStates = safeTurtleStates(message.turtleStates)
         end
+        if not NATIVE_TABS and message.player ~= nil then applyControllerPlayer(message.player) end
         saveRelayState()
         for _, command in ipairs(pendingCommands) do
             rednet.send(controllerId, {
@@ -1072,6 +1103,10 @@ local function handleControllerMessage(sender, message)
             end
         end
         printAsync(message.text or "", false)
+    elseif message.type == "PLAYER_UPDATE" and sender == controllerId
+        and message.controllerBootId == controllerBootId then
+        applyControllerPlayer(message.player)
+        renderMap()
     elseif message.type == "TURTLE_UPDATE" and sender == controllerId
         and message.controllerBootId == controllerBootId then
         if type(message.turtle) == "table" and message.turtle.id then
@@ -1155,25 +1190,112 @@ local function forwardUpload(transfer)
         end
         return
     end
-    if files["relay.lua"] and files["startup.lua"] and not files["upload.lua"] then
-        local stage = "/.relay-self-update"
-        if fs.exists(stage) then fs.delete(stage) end
-        fs.makeDir(stage)
-        for _, name in ipairs({ "relay.lua", "startup.lua" }) do
-            local handle, openError = fs.open(fs.combine(stage, name), "w")
-            if not handle then
-                fs.delete(stage)
-                printError("Relay self-update failed: " .. tostring(openError))
+    if files["relay-manifest.lua"] and not files["upload.lua"] then
+        local manifestChunk, manifestError = load(
+            files["relay-manifest.lua"], "@relay-manifest.lua", "t", {}
+        )
+        if not manifestChunk then printError("Relay manifest is invalid: " .. manifestError) return end
+        local manifestOk, manifest = pcall(manifestChunk)
+        if not manifestOk or type(manifest) ~= "table" or manifest.version ~= 1
+            or type(manifest.files) ~= "table" or #manifest.files == 0 then
+            printError("Relay manifest must return a version 1 file list")
+            return
+        end
+        local entries, seen = {}, {}
+        for _, entry in ipairs(manifest.files) do
+            local source = type(entry) == "table" and entry.source
+            local path = type(entry) == "table" and entry.path
+            if type(source) ~= "string" or source ~= fs.getName(source)
+                or type(path) ~= "string" or path == "" or path:sub(1, 1) == "/"
+                or path:find("..", 1, true) or path:find("\\", 1, true)
+                or path:match("^data/") or path:match("^%.relay") or seen[path]
+                or type(files[source]) ~= "string" then
+                printError("Relay manifest has an unsafe, duplicate, or missing file")
                 return
             end
-            handle.write(files[name])
-            handle.close()
+            if path:sub(-4) == ".lua" then
+                local chunk, syntaxError = load(files[source], "@/" .. path, "t", _ENV)
+                if not chunk then
+                    printError(("Relay update rejected invalid %s: %s"):format(path, syntaxError))
+                    return
+                end
+            end
+            seen[path] = true
+            entries[#entries + 1] = { source = source, path = path }
         end
-        if fs.exists("/relay.lua") then fs.delete("/relay.lua") end
-        if fs.exists("/startup.lua") then fs.delete("/startup.lua") end
-        fs.move(fs.combine(stage, "relay.lua"), "/relay.lua")
-        fs.move(fs.combine(stage, "startup.lua"), "/startup.lua")
-        fs.delete(stage)
+
+        local root = "/.relay-self-update"
+        local stageRoot, backupRoot = fs.combine(root, "stage"), fs.combine(root, "backup")
+        if fs.exists(root) then fs.delete(root) end
+        fs.makeDir(stageRoot)
+        local marker = { version = 1, files = {} }
+        for _, entry in ipairs(entries) do
+            local staged = fs.combine(stageRoot, entry.path)
+            local parent = fs.getDir(staged)
+            if parent ~= "" and not fs.exists(parent) then fs.makeDir(parent) end
+            local handle, openError = fs.open(staged, "w")
+            if not handle then
+                fs.delete(root)
+                printError("Relay self-update staging failed: " .. tostring(openError))
+                return
+            end
+            local wrote, writeError = pcall(handle.write, files[entry.source])
+            pcall(handle.close)
+            if not wrote then
+                fs.delete(root)
+                printError("Relay self-update staging failed: " .. tostring(writeError))
+                return
+            end
+            marker.files[#marker.files + 1] = {
+                path = entry.path, existed = fs.exists("/" .. entry.path),
+            }
+        end
+        local markerHandle, markerError = fs.open(fs.combine(root, "installing"), "w")
+        if not markerHandle then
+            fs.delete(root)
+            printError("Relay update marker failed: " .. tostring(markerError))
+            return
+        end
+        local markerWrote, markerWriteError = pcall(function()
+            markerHandle.write(textutils.serialize(marker, { compact = true }))
+            markerHandle.close()
+        end)
+        if not markerWrote then
+            pcall(markerHandle.close)
+            fs.delete(root)
+            printError("Relay update marker failed: " .. tostring(markerWriteError))
+            return
+        end
+
+        local installed, installError = pcall(function()
+            for _, entry in ipairs(entries) do
+                local destination, backup = "/" .. entry.path, fs.combine(backupRoot, entry.path)
+                if fs.exists(destination) then
+                    local backupParent = fs.getDir(backup)
+                    if backupParent ~= "" and not fs.exists(backupParent) then fs.makeDir(backupParent) end
+                    fs.copy(destination, backup)
+                    fs.delete(destination)
+                end
+                local parent = fs.getDir(destination)
+                if parent ~= "" and not fs.exists(parent) then fs.makeDir(parent) end
+                fs.move(fs.combine(stageRoot, entry.path), destination)
+            end
+        end)
+        if not installed then
+            for _, entry in ipairs(marker.files) do
+                local destination, backup = "/" .. entry.path, fs.combine(backupRoot, entry.path)
+                if fs.exists(backup) then
+                    if fs.exists(destination) then fs.delete(destination) end
+                    fs.move(backup, destination)
+                elseif not entry.existed and fs.exists(destination) then
+                    fs.delete(destination)
+                end
+            end
+            fs.delete(root)
+            printError("Relay self-update install failed: " .. tostring(installError))
+            return
+        end
+        fs.delete(root)
         print("Deployment relay updated. Rebooting...")
         sleep(1)
         os.reboot()
@@ -1415,6 +1537,15 @@ while true do
         panMap(0, -1)
     elseif event == "key" and activeTab == "map" and first == keys.down then
         panMap(0, 1)
+    elseif event == "key" and activeTab == "map" and first == keys.pageUp then
+        setZoom(math.floor(mapZoom() / 2))
+    elseif event == "key" and activeTab == "map" and first == keys.pageDown then
+        setZoom(mapZoom() * 2)
+    elseif event == "key" and activeTab == "map" and first == keys.space then
+        relayState.ui.followPlayer = true
+        if playerPosition then mapCenter.x, mapCenter.z = playerPosition.x, playerPosition.z end
+        saveRelayState()
+        renderMap()
     elseif event == "key" and activeTab == "map" and first == keys.tab then
         switchTab("command")
     elseif event == "key" and activeTab == "command" and first == keys.backspace and #input > 0 then

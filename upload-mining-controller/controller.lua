@@ -6,6 +6,11 @@ local BOOT_ID = ("%d:%d"):format(os.getComputerID(), os.epoch("utc"))
 local storage = require("lib.controller_storage")
 local routePlanner = require("lib.controller_route")
 
+local function finiteNumber(value)
+    return type(value) == "number" and value == value
+        and value > -math.huge and value < math.huge
+end
+
 local function detachedCopy(value, ancestors)
     if type(value) ~= "table" then return value end
     ancestors = ancestors or {}
@@ -161,6 +166,8 @@ local controllerState = loadState()
 local farmMapsTrimmedAtBoot = boundFarmMaps(controllerState.farmMaps)
 local activeRelays = {}
 local announcedTurtleRelease
+local trackedPlayer
+local playerDetector = peripheral.find("playerDetector") or peripheral.find("player_detector")
 for _, turtleInfo in pairs(controllerState.turtles) do turtleInfo.online = false end
 
 local function installedRelease()
@@ -327,6 +334,47 @@ local actionableStatuses = {
 local function registerRelay(relayId)
     controllerState.relays[relayId] = os.epoch("utc")
     activeRelays[relayId] = true
+end
+
+local function readTrackedPlayer()
+    if not playerDetector then
+        playerDetector = peripheral.find("playerDetector") or peripheral.find("player_detector")
+    end
+    if not playerDetector then return nil end
+    local playerName = settings.get("bucky.player")
+    if type(playerName) ~= "string" or playerName == "" then
+        local ok, online = pcall(playerDetector.getOnlinePlayers)
+        if not ok or type(online) ~= "table" or #online ~= 1 then return nil end
+        playerName = online[1]
+    end
+    local ok, position = pcall(playerDetector.getPlayerPos, playerName)
+    if not ok or type(position) ~= "table" or not finiteNumber(position.x)
+        or not finiteNumber(position.y) or not finiteNumber(position.z)
+        or not finiteNumber(position.yaw) then return nil end
+    return {
+        name = tostring(playerName):sub(1, 64),
+        x = position.x, y = position.y, z = position.z,
+        yaw = position.yaw, pitch = finiteNumber(position.pitch) and position.pitch or nil,
+        sampledAt = os.epoch("utc"),
+    }
+end
+
+local function sendTrackedPlayer(recipient)
+    local message = {
+        type = "PLAYER_UPDATE", controllerBootId = BOOT_ID,
+        player = trackedPlayer and detachedCopy(trackedPlayer) or false,
+    }
+    if recipient then
+        rednet.send(recipient, message, JOB_PROTOCOL)
+    else
+        for relayId in pairs(activeRelays) do rednet.send(relayId, message, JOB_PROTOCOL) end
+    end
+end
+
+local function pollTrackedPlayer()
+    local previousAvailable = trackedPlayer ~= nil
+    trackedPlayer = readTrackedPlayer()
+    if trackedPlayer or previousAvailable then sendTrackedPlayer() end
 end
 
 local function sendWorkerAlert(turtleId, turtleName, status, detail, sourceId, customText)
@@ -1301,6 +1349,7 @@ showHelp()
 controllerHeartbeat()
 
 local announceTimer = os.startTimer(15)
+local playerTimer = os.startTimer(0.1)
 local input = ""
 write("controller> ")
 while true do
@@ -1325,6 +1374,9 @@ while true do
         expireTurtleLeases()
         controllerHeartbeat()
         announceTimer = os.startTimer(15)
+    elseif event == "timer" and first == playerTimer then
+        pollTrackedPlayer()
+        playerTimer = os.startTimer(0.5)
     elseif event == "rednet_message" and third == JOB_PROTOCOL then
         if type(second) == "table" and second.type == "CONTROLLER_QUERY" then
             controllerHello(first)
@@ -1339,6 +1391,7 @@ while true do
                     controllerBootId = BOOT_ID,
                     turtles = turtles,
                     turtleStates = relayTurtleStates(),
+                    player = trackedPlayer and detachedCopy(trackedPlayer) or false,
                     sites = sites,
                     farmMapKeys = farmMapIndex(),
                 }, JOB_PROTOCOL)
