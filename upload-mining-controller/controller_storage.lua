@@ -84,11 +84,14 @@ local function compactFarm(farmMap)
         return nameIds[name]
     end
     for _, cell in pairs(farmMap.data and farmMap.data.cells or {}) do
-        result.cells[#result.cells + 1] = {
-            cell.x, cell.y, cell.z, nameId(cell.name), nameId(cell.class),
-            nameId(cell.occupant), nameId(cell.occupantClass), cell.occupantY or 0,
-            cell.verticalStructure and 1 or 0,
-        }
+        if cell.class ~= "air" and cell.name ~= "minecraft:air"
+            and cell.name ~= "minecraft:cave_air" and cell.name ~= "minecraft:void_air" then
+            result.cells[#result.cells + 1] = {
+                cell.x, cell.y, cell.z, nameId(cell.name), nameId(cell.class),
+                nameId(cell.occupant), nameId(cell.occupantClass), cell.occupantY or 0,
+                cell.verticalStructure and 1 or 0,
+            }
+        end
     end
     table.sort(result.cells, function(a, b) return a[1] == b[1] and a[3] < b[3] or a[1] < b[1] end)
     return result
@@ -111,7 +114,9 @@ local function expandFarm(value)
             occupantY = tonumber(row[8]) ~= 0 and tonumber(row[8]) or nil,
             verticalStructure = tonumber(row[9]) == 1,
         }
-        if cell.x and cell.y and cell.z then
+        if cell.x and cell.y and cell.z and cell.class ~= "air"
+            and cell.name ~= "minecraft:air" and cell.name ~= "minecraft:cave_air"
+            and cell.name ~= "minecraft:void_air" then
             result.data.cells[("%d:%d"):format(cell.x, cell.z)] = cell
         end
     end

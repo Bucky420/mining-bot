@@ -103,6 +103,7 @@ local farm = {
                 x = 1, y = 70, z = 2, name = "minecraft:grass_block", class = "grass",
                 occupant = "minecraft:wheat", occupantClass = "crop", occupantY = 71,
             },
+            ["2:2"] = { x = 2, y = 77, z = 2, name = "minecraft:air", class = "air" },
         },
     },
 }
@@ -112,6 +113,7 @@ local loaded, readError = storage.readFarm(reference)
 assert(loaded, readError)
 assert(loaded.revision == 4 and loaded.data.cells["1:2"].occupant == "minecraft:wheat",
     "terrain region should survive compact storage round trip")
+assert(loaded.data.cells["2:2"] == nil, "scan-edge air was persisted as a 2D surface")
 
 local spatialValue = { version = 1, farmId = "farm:test", chunkKey = "0:4:0", cells = {} }
 local spatialReference, spatialError = storage.writeValue(

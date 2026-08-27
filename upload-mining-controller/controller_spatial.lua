@@ -64,6 +64,129 @@ local function validChunk(chunk)
     return true
 end
 
+local function chunkCoordinates(chunkKey)
+    if type(chunkKey) ~= "string" then return nil end
+    local x, y, z = chunkKey:match("^(-?%d+):(-?%d+):(-?%d+)$")
+    if not x then return nil end
+    return tonumber(x), tonumber(y), tonumber(z)
+end
+
+local function validCompactChunk(value)
+    if type(value) ~= "table" or value.format ~= 2 or type(value.f) ~= "string"
+        or type(value.k) ~= "string" or type(value.n) ~= "table"
+        or type(value.d) ~= "table" or type(value.o) ~= "table" then return false end
+    if not chunkCoordinates(value.k) then return false end
+    for _, name in ipairs(value.n) do
+        if type(name) ~= "string" then return false end
+    end
+    local previousEnd = -1
+    for _, run in ipairs(value.d) do
+        local start, length, nameId = tonumber(run[1]), tonumber(run[2]), tonumber(run[3])
+        if not start or start ~= math.floor(start) or start <= previousEnd or start < 0
+            or not length or length ~= math.floor(length) or length < 1 or start + length > 4096
+            or not nameId or nameId ~= math.floor(nameId) or type(value.n[nameId]) ~= "string" then
+            return false
+        end
+        previousEnd = start + length - 1
+    end
+    for _, origin in ipairs(value.o) do
+        if type(origin) ~= "table" or type(origin[1]) ~= "number"
+            or type(origin[2]) ~= "number" or type(origin[3]) ~= "number"
+            or type(origin[4]) ~= "number" or type(origin[6]) ~= "number" then return false end
+    end
+    return true
+end
+
+local function validStoredChunk(value)
+    return validChunk(value) or validCompactChunk(value)
+end
+
+local function compactChunk(chunk)
+    local chunkX, chunkY, chunkZ = chunkCoordinates(chunk.chunkKey)
+    if not chunkX then return nil, "INVALID_SPATIAL_CHUNK_KEY" end
+    local names, byOffset = {}, {}
+    for _, cell in ipairs(chunk.cells) do
+        local localX, localY, localZ = cell.x - chunkX * 16, cell.y - chunkY * 16, cell.z - chunkZ * 16
+        if localX < 0 or localX > 15 or localY < 0 or localY > 15 or localZ < 0 or localZ > 15
+            or localX ~= math.floor(localX) or localY ~= math.floor(localY)
+            or localZ ~= math.floor(localZ) then return nil, "SPATIAL_CELL_OUTSIDE_CHUNK" end
+        local offset = localY * 256 + localZ * 16 + localX
+        byOffset[offset], names[cell.name] = cell.name, true
+    end
+    local palette = {}
+    for name in pairs(names) do palette[#palette + 1] = name end
+    table.sort(palette)
+    local nameIds = {}
+    for index, name in ipairs(palette) do nameIds[name] = index end
+    local offsets = {}
+    for offset in pairs(byOffset) do offsets[#offsets + 1] = offset end
+    table.sort(offsets)
+    local runs = {}
+    for _, offset in ipairs(offsets) do
+        local nameId = nameIds[byOffset[offset]]
+        local previous = runs[#runs]
+        if previous and previous[1] + previous[2] == offset and previous[3] == nameId then
+            previous[2] = previous[2] + 1
+        else
+            runs[#runs + 1] = { offset, 1, nameId }
+        end
+    end
+    local origins = {}
+    for _, origin in ipairs(chunk.surveyOrigins or {}) do
+        origins[#origins + 1] = {
+            origin.version, origin.x, origin.y, origin.z,
+            origin.radius or 0, origin.verifiedAt,
+        }
+    end
+    return {
+        format = 2,
+        f = chunk.farmId,
+        k = chunk.chunkKey,
+        r = chunk.revision or 0,
+        t = chunk.verifiedAt or 0,
+        c = chunk.changeCount or 0,
+        n = palette,
+        d = runs,
+        o = origins,
+    }
+end
+
+local function expandChunk(value)
+    if type(value) ~= "table" or value.format ~= 2 then return value end
+    local chunkX, chunkY, chunkZ = chunkCoordinates(value.k)
+    local cells = {}
+    for _, run in ipairs(value.d) do
+        for offset = run[1], run[1] + run[2] - 1 do
+            local localX = offset % 16
+            local localZ = math.floor(offset / 16) % 16
+            local localY = math.floor(offset / 256)
+            cells[#cells + 1] = {
+                x = chunkX * 16 + localX,
+                y = chunkY * 16 + localY,
+                z = chunkZ * 16 + localZ,
+                name = value.n[run[3]],
+            }
+        end
+    end
+    local origins = {}
+    for _, origin in ipairs(value.o) do
+        origins[#origins + 1] = {
+            version = origin[1], x = origin[2], y = origin[3], z = origin[4],
+            radius = origin[5], verifiedAt = origin[6],
+        }
+    end
+    return {
+        version = 1,
+        farmId = value.f,
+        chunkKey = value.k,
+        revision = value.r,
+        verifiedAt = value.t,
+        changeCount = value.c,
+        cells = cells,
+        surveyOrigins = origins,
+    }
+end
+
 function spatial.configure(index)
     spatialIndex = type(index) == "table" and index or {}
 end
@@ -80,8 +203,9 @@ end
 function spatial.read(farmId, chunkKey)
     local entry = spatialIndex[farmId] and spatialIndex[farmId][chunkKey]
     if entry then
-        local value, readError = storage.readValue(entry, validChunk)
+        local value, readError = storage.readValue(entry, validStoredChunk)
         if not value then return nil, readError end
+        value = expandChunk(value)
         if value.farmId ~= farmId or value.chunkKey ~= chunkKey then
             return nil, "SPATIAL_CHUNK_ID_MISMATCH"
         end
@@ -140,10 +264,12 @@ function spatial.write(chunk)
         cells = chunk.cells,
         surveyOrigins = origins,
     }
+    local compact, compactError = compactChunk(value)
+    if not compact then return false, compactError end
     local farmIndex = indexFor(chunk.farmId)
     local entry, writeError = storage.writeValue(
-        mountedFile(chunk.farmId, chunk.chunkKey), value,
-        farmIndex[chunk.chunkKey], validChunk
+        mountedFile(chunk.farmId, chunk.chunkKey), compact,
+        farmIndex[chunk.chunkKey], validCompactChunk
     )
     if not entry then return false, writeError end
     entry.revision, entry.verifiedAt = value.revision, value.verifiedAt
@@ -151,12 +277,33 @@ function spatial.write(chunk)
     return true
 end
 
+function spatial.compactIndexed()
+    local changed = false
+    for farmId, farmIndex in pairs(spatialIndex) do
+        for chunkKey, indexEntry in pairs(farmIndex) do
+            local stored = storage.readValue(indexEntry, validStoredChunk)
+            if stored and stored.format ~= 2 then
+                local chunk = expandChunk(stored)
+                local first = spatial.write(chunk)
+                if first then
+                    -- A second atomic rotation replaces the retained verbose rollback copy.
+                    local second = spatial.write(chunk)
+                    if second then changed = true end
+                end
+            end
+            if type(sleep) == "function" then sleep(0) end
+        end
+    end
+    return changed
+end
+
 local function surveySweepPoints(centerX, centerZ, radius, step, y)
-    local result, minimumX, maximumX = {}, centerX - radius, centerX + radius
+    local result, seen, minimumX, maximumX = {}, {}, centerX - radius, centerX + radius
     local function append(x, z)
-        local previous = result[#result]
-        if not previous or previous.x ~= x or previous.z ~= z then
+        local pointKey = ("%d:%d"):format(x, z)
+        if not seen[pointKey] then
             result[#result + 1] = { x = x, y = y, z = z }
+            seen[pointKey] = true
         end
     end
     local rows = {}

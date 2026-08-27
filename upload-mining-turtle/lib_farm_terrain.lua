@@ -252,10 +252,6 @@ function terrain.buildSurface(blocks, center, radius, baseY, maxOffset)
                 if not surface or item.y > surface.y then surface = item end
             end
         end
-        if not surface and #column.records > 0 then
-            local air = column.records[#column.records]
-            if air.class == "air" then surface = air end
-        end
         if surface then
             local occupants = {}
             for _, item in ipairs(column.records) do

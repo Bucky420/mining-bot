@@ -781,13 +781,18 @@ local function renderMap()
             end
         end
     end
-    local status = ("%s z%d P:%s Y:%s UP:%s %d,%d"):format(
-        relayState.ui.followPlayer and "FOLLOW" or "PAN", zoom,
-        playerPosition and math.floor(playerPosition.y) or "?",
-        tostring(relayState.ui.caveLayer or "?"),
-        viewHeading:sub(1, 1):upper(),
-        math.floor(mapCenter.x), math.floor(mapCenter.z)
-    )
+    local status = width < 40
+        and ("%s z%d M:%s P:%s Y:%s UP:%s"):format(
+            relayState.ui.followPlayer and "F" or "P", zoom,
+            getCaveMode():sub(1, 1):upper(), playerPosition and math.floor(playerPosition.y) or "?",
+            tostring(relayState.ui.caveLayer or "?"), viewHeading:sub(1, 1):upper()
+        )
+        or ("%s z%d M:%s P:%s Y:%s UP:%s %d,%d"):format(
+            relayState.ui.followPlayer and "FOLLOW" or "PAN", zoom,
+            getCaveMode():sub(1, 1):upper(), playerPosition and math.floor(playerPosition.y) or "?",
+            tostring(relayState.ui.caveLayer or "?"), viewHeading:sub(1, 1):upper(),
+            math.floor(mapCenter.x), math.floor(mapCenter.z)
+        )
     if selectedName and #status < width then
         status = status .. (" T:%s Y:%d"):format(tostring(selectedName), selectedHeight)
     elseif nearestName and #status < width then

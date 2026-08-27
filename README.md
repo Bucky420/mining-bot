@@ -167,6 +167,8 @@ shows the corresponding world direction.
 - `[` and `]` select a manual Y level. `L` toggles automatic mode, which follows
   the player/turtle Y and switches back to the grass surface map when the known
   column is open to the surface.
+- `A` selects automatic surface/cave mode, `S` forces the surface map, and `C`
+  forces cave mode. The footer shows the active mode as `M:A`, `M:S`, or `M:C`.
 - Cave layers show walkable two-block-high tunnels, walls, low ceilings, and
   pits. Unknown cells remain blank, and the 2D surface map is the fallback until
   3D data exists.
@@ -236,20 +238,24 @@ nearest reachable frontier, scans there, publishes the delta, and repeats. It
 may use a nearby scan cell when the nominal center is occupied. It preserves
 trees, excludes their occupied canopy cells, and applies a three-block
 construction and travel margin around fences, buildings, unknown blocks, and
-terrain outside the vertical limit. Fully enclosed natural sand or stone surface
-islands may be replaced with dirt. Fully enclosed holes no deeper than three
-blocks may be filled. Every destructive operation re-inspects the live block and
-checkpoints before changing it.
+terrain outside the vertical limit. Spherical scan-edge air remains unknown
+rather than becoming a false 2D surface. Before planning, the turtle republishes
+its current 2D revision and waits for the controller's persisted ACK. Fully
+enclosed natural sand or stone surface islands may be replaced with dirt. Fully
+enclosed holes no deeper than three blocks may be filled. Every destructive
+operation re-inspects the live block and checkpoints before changing it.
 
 The mining controller persists authoritative 3D terrain as atomic 16x16x16
 chunk files under `bucky/terrain-3d/` on mounted storage computers. Chunks
-include known air, solid blocks, verification time, and a change count. The
-turtle requests chunks only for job-local navigation and recovery, keeps a 3x3
-chunk window in RAM, and merges fresh Geo Scanner results without allowing an
-older controller snapshot to overwrite newer local observations. Stable chunks
-are reused for up to 24 hours, while chunks with observed changes are refreshed
-after 15 minutes when approached. Ordinary crop work still updates inspected
-cells individually instead of triggering whole-farm scans.
+use a block-name palette and run-length encoded local coordinates while retaining
+known air, solid blocks, verification time, and a change count. Existing verbose
+chunks and their rollback copies are converted atomically when the controller
+boots. The turtle requests chunks only for job-local navigation and recovery,
+keeps a 3x3 chunk window in RAM, and merges fresh Geo Scanner results without
+allowing an older controller snapshot to overwrite newer local observations.
+Stable chunks are reused for up to 24 hours, while chunks with observed changes
+are refreshed after 15 minutes when approached. Ordinary crop work still updates
+inspected cells individually instead of triggering whole-farm scans.
 
 Survey coverage is versioned separately from stored terrain. Legacy 2D maps and
 older 3D chunks remain available for surface display and rollback, but they do

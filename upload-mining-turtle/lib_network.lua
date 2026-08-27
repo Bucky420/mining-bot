@@ -533,6 +533,34 @@ function network.reportFarmMap(payload)
     return true
 end
 
+function network.syncFarmMap(payload)
+    local data = state.get()
+    local controllerId = data.controllerId or config.network.controllerId
+    if not controllerId then return false, "NO_CONTROLLER_CONFIGURED" end
+    local opened, openError = openModems()
+    if not opened then return false, openError end
+    local sequence = data.nextReportSequence or 1
+    data.nextReportSequence = sequence + 1
+    local message = {
+        type = "FARM_MAP",
+        messageId = ("farm-map-sync-%d-%d-%d"):format(os.getComputerID(), util.now(), sequence),
+        turtleId = os.getComputerID(),
+        status = data.status,
+        position = util.detachedCopy(data.position),
+        heading = data.heading,
+        positionVerifiedAt = data.positionVerifiedAt,
+        payload = util.detachedCopy(payload),
+        sentAt = util.now(),
+    }
+    local lastError
+    for _ = 1, 3 do
+        local sent, sendError = sendReport(controllerId, message)
+        if sent then return true end
+        lastError = sendError
+    end
+    return false, lastError or "FARM_MAP_SYNC_NOT_ACKNOWLEDGED"
+end
+
 function network.receiveJob(timeout, attachedOnly)
     local ok = attachedOnly and openAttachedModems() or openModems()
     if not ok then return nil end

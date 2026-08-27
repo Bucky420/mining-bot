@@ -408,9 +408,8 @@ local function refreshSurveyNavigation(progress)
     applyNavigationMap(progress, surfaces, provisional)
 end
 
-local function reportMap(progress, job, delta)
-    progress.farmRevision = (progress.farmRevision or 0) + 1
-    return network.reportFarmMap({
+local function mapPayload(progress, job, delta)
+    return {
         farmId = progress.farm.id,
         revision = progress.farmRevision,
         jobId = job.id,
@@ -422,7 +421,12 @@ local function reportMap(progress, job, delta)
         summary = progress.planSummary,
         delta = copy(delta or {}),
         alerts = copy(progress.alerts),
-    })
+    }
+end
+
+local function reportMap(progress, job, delta)
+    progress.farmRevision = (progress.farmRevision or 0) + 1
+    return network.reportFarmMap(mapPayload(progress, job, delta))
 end
 
 local function reportMapChunks(progress, job, delta)
@@ -782,7 +786,11 @@ local function assignPlanRows(progress, cropIds)
     end
 end
 
-local function buildPlan(progress)
+local function buildPlan(progress, job)
+    local synchronized, syncError = network.syncFarmMap(mapPayload(progress, job, {}))
+    if not synchronized then
+        return false, "CONTROLLER_TERRAIN_SYNC_FAILED: " .. tostring(syncError)
+    end
     local remoteCells, terrainError = network.requestFarmTerrain(
         progress.farm.id, progress.farmRevision
     )
@@ -1533,7 +1541,7 @@ function service.run(job, framework)
         if progress.phase == "SURVEY" then
             local ok, reason = survey(progress, job, framework)
             if not ok then return serviceFailure(progress, job, framework, reason) end
-            local planned, planError = buildPlan(progress)
+            local planned, planError = buildPlan(progress, job)
             if not planned then return serviceFailure(progress, job, framework, planError) end
         elseif progress.phase == "PREPARE" then
             local ok, reason = runCellPhase(progress, job, framework, "PREPARE",

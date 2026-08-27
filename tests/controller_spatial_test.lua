@@ -1,6 +1,7 @@
 local stored = {}
 package.loaded["lib.controller_storage"] = {
-    writeValue = function(file, value)
+    writeValue = function(file, value, indexEntry)
+        file = indexEntry and indexEntry.file or file
         stored[file] = value
         return { volumeId = "volume-test", file = file }
     end,
@@ -36,6 +37,13 @@ assert(spatial.write({
 }))
 assert(index.farm and index.farm["0:4:0"].volumeId == "volume-test",
     "3D chunk was not indexed by stable volume ID")
+local compact = stored[index.farm["0:4:0"].file]
+assert(compact.format == 2 and type(compact.n) == "table" and type(compact.d) == "table",
+    "3D chunk was not stored in compact format")
+assert(#compact.d < #cells / 2, "3D chunk run-length encoding did not reduce repeated cells")
+local roundTrip = assert(spatial.read("farm", "0:4:0"))
+assert(#roundTrip.cells == #cells and roundTrip.cells[1].name == "minecraft:stone",
+    "compact 3D chunk did not survive expansion")
 assert(spatial.classify("farm", 8, 70, 8) == "surface",
     "known open column was not classified as surface")
 local oldPlan = spatial.surveyPlan("farm", 8, 8, 65, 8, 8, { x = 8, z = 8 })
@@ -70,5 +78,18 @@ for _, cell in ipairs(slice) do
     if cell.x == 8 and cell.z == 8 then tunnel = cell break end
 end
 assert(tunnel and tunnel.class == "tunnel", "3D slice did not project walkable tunnel floor")
+
+stored["legacy.map"] = {
+    version = 1, farmId = "legacy", chunkKey = "-1:4:-1", revision = 1,
+    verifiedAt = 4000,
+    cells = { { x = -1, y = 64, z = -1, name = "minecraft:air" } },
+    surveyOrigins = {},
+}
+index.legacy = { ["-1:4:-1"] = { volumeId = "volume-test", file = "legacy.map" } }
+assert(spatial.compactIndexed(), "legacy 3D chunks were not compacted")
+assert(stored["legacy.map"].format == 2, "legacy 3D chunk retained verbose storage")
+local migrated = assert(spatial.read("legacy", "-1:4:-1"))
+assert(migrated.cells[1].x == -1 and migrated.cells[1].z == -1,
+    "negative compact chunk coordinates did not round trip")
 
 print("controller spatial tests passed")

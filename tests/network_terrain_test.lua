@@ -38,6 +38,9 @@ rednet = {
     receive = function()
         local value = table.remove(responses, 1)
         if not value then now = now + 10000 return nil end
+        if value == "ACK_LAST" then
+            return 9, { type = "REPORT_ACK", messageId = lastSent.message.messageId }
+        end
         return value[1], value[2]
     end,
 }
@@ -142,6 +145,14 @@ assert(reported and not reportError and #stateData.reportOutbox == 0,
 reported, reportError = network.reportFarmMap({ farmId = "farm", revision = 11, delta = {} })
 assert(reported and not reportError and #stateData.reportOutbox == 0,
     "live farm map report was persisted on the turtle")
+assert(lastSent.message.type == "FARM_MAP" and lastSent.message.payload.revision == 11)
+
+responses = {
+    "ACK_LAST",
+}
+reported, reportError = network.syncFarmMap({ farmId = "farm", revision = 11, delta = {} })
+assert(reported and not reportError and #stateData.reportOutbox == 0,
+    "farm map synchronization was not acknowledged")
 assert(lastSent.message.type == "FARM_MAP" and lastSent.message.payload.revision == 11)
 
 reported, reportError = network.reportFarmSpatial("farm", {

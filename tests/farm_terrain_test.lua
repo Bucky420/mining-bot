@@ -6,6 +6,10 @@ local function check(condition, message)
     if not condition then error("farm terrain test failed: " .. message, 0) end
 end
 
+check(#terrain.buildSurface({
+    { x = 0, y = 75, z = 0, name = "minecraft:air" },
+}, { x = 0, z = 0 }, 8, 70, 3) == 0, "scan-edge air became a persisted surface")
+
 local function count(list)
     return #list
 end

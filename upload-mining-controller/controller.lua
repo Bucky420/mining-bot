@@ -517,6 +517,7 @@ for farmKey, farmMap in pairs(controllerState.farmMaps) do
     end
 end
 local spatialStorageChanged = spatialStorage.migrateLegacy()
+if spatialStorage.compactIndexed() then spatialStorageChanged = true end
 if farmMapsTrimmedAtBoot or storageChanged or spatialStorageChanged then saveState() end
 
 local actionableStatuses = {
@@ -1211,6 +1212,13 @@ local function storeFarmMap(value, fallbackId)
             cells[("%d:%d"):format(cell.x, cell.z)] = detachedCopy(cell)
         end
     end
+    local compacted = false
+    for cellKey, cell in pairs(cells) do
+        if cell.class == "air" or cell.name == "minecraft:air"
+            or cell.name == "minecraft:cave_air" or cell.name == "minecraft:void_air" then
+            cells[cellKey], compacted = nil, true
+        end
+    end
     data.delta = nil
     data.cells = cells
     local candidate = {
@@ -1227,7 +1235,7 @@ local function storeFarmMap(value, fallbackId)
     if not stored then return key, false, false, storageError end
     controllerState.terrainStorage[key] = stored
     controllerState.farmMaps[key] = candidate
-    return key, true, false
+    return key, true, compacted
 end
 
 local function handleRemoteCommand(sender, message)
