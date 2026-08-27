@@ -4,9 +4,22 @@ local PROJECT = "mining-bot"
 local TARGET = turtle and "turtle" or "controller"
 local TIMEOUT = 8
 local STAGE = "/.deployment-stage"
+local FILE_TEMP = "/.deployment-file.tmp"
 local BACKUP = "/.deployment-backup"
 local INSTALLING = "/.deployment-installing"
 local DEPLOYMENT_STATE = "/data/deployment.state"
+
+local function cleanupLowWorkerSpace()
+    if TARGET ~= "turtle" or type(fs.getFreeSpace) ~= "function" then return end
+    local free = fs.getFreeSpace("/")
+    if type(free) ~= "number" or free >= 32768 then return end
+    for _, path in ipairs({ "/data/worker.log.old", "/data/worker.log" }) do
+        if fs.exists(path) then fs.delete(path) end
+        if fs.getFreeSpace("/") >= 32768 then break end
+    end
+end
+
+cleanupLowWorkerSpace()
 
 local modemItems = {
     ["computercraft:wireless_modem_normal"] = true,
@@ -59,8 +72,7 @@ local function writeTable(path, value)
     local previous = path .. ".previous"
     if fs.exists(previous) then fs.delete(previous) end
     if fs.exists(path) then
-        fs.copy(path, previous)
-        fs.delete(path)
+        fs.move(path, previous)
     end
     fs.move(temporary, path)
     if fs.exists(previous) then fs.delete(previous) end
@@ -102,6 +114,7 @@ local function rollback(interrupted)
     end
     if fs.exists(BACKUP) then fs.delete(BACKUP) end
     if fs.exists(STAGE) then fs.delete(STAGE) end
+    if fs.exists(FILE_TEMP) then fs.delete(FILE_TEMP) end
     if fs.exists(INSTALLING) then fs.delete(INSTALLING) end
     if fs.exists(INSTALLING .. ".tmp") then fs.delete(INSTALLING .. ".tmp") end
     printError("Rolled back an interrupted deployment before startup.")
@@ -183,11 +196,9 @@ local function discoverServer()
     end
 end
 
-local function stageFile(path, contents)
-    local destination = fs.combine(STAGE, path)
-    local parent = fs.getDir(destination)
-    if parent ~= "" and not fs.exists(parent) then fs.makeDir(parent) end
-    local handle, openError = fs.open(destination, "w")
+local function stageFile(contents)
+    if fs.exists(FILE_TEMP) then fs.delete(FILE_TEMP) end
+    local handle, openError = fs.open(FILE_TEMP, "w")
     if not handle then return false, openError end
     handle.write(contents)
     handle.close()
@@ -245,6 +256,12 @@ end
 
 local interrupted = readTable(INSTALLING)
 if interrupted then rollback(interrupted) end
+if not interrupted then
+    -- A download can fail before the installation marker is written. Those
+    -- files are never installed and must not survive into the next boot.
+    if fs.exists(STAGE) then fs.delete(STAGE) end
+    if fs.exists(FILE_TEMP) then fs.delete(FILE_TEMP) end
+end
 if fs.exists(BACKUP) then fs.delete(BACKUP) end
 local saved = readTable(DEPLOYMENT_STATE)
 interrupted = nil
@@ -307,39 +324,14 @@ if type(manifest.files) ~= "table" or #manifest.files == 0 then
     error("Deployment manifest is empty", 0)
 end
 
-if fs.exists(STAGE) then fs.delete(STAGE) end
-fs.makeDir(STAGE)
 local manifestPaths = {}
+local nextPaths, existingPaths, affectedPaths = {}, {}, {}
 for index, entry in ipairs(manifest.files) do
     if type(entry) ~= "table" or not safeDestination(entry.path) or manifestPaths[entry.path]
         or type(entry.size) ~= "number" then
         error("Deployment manifest contains an unknown or duplicate path", 0)
     end
     manifestPaths[entry.path] = true
-    write(("Downloading %d/%d %s... "):format(index, #manifest.files, entry.path))
-    local fileNonce = nonce("file:" .. index)
-    rednet.send(serverId, {
-        type = "GET_FILE", nonce = fileNonce, project = PROJECT, target = TARGET, path = entry.path,
-    }, PROTOCOL)
-    local response, fileError = receiveFrom(serverId, "FILE", fileNonce)
-    if not response then error("Download failed: " .. tostring(fileError), 0) end
-    if response.release ~= manifest.release or response.path ~= entry.path
-        or type(response.contents) ~= "string" or #response.contents ~= entry.size then
-        error("Deployment changed during download; retry after uploads settle", 0)
-    end
-    if entry.path:sub(-4) == ".lua" then
-        local chunk, syntaxError = load(response.contents, "@/" .. entry.path, "t", _ENV)
-        if not chunk then error(("Invalid %s: %s"):format(entry.path, syntaxError), 0) end
-    end
-    local wrote, writeError = stageFile(entry.path, response.contents)
-    if not wrote then error(("Cannot stage %s: %s"):format(entry.path, tostring(writeError)), 0) end
-    print("ok")
-end
-
-local nextPaths = {}
-local existingPaths = {}
-local affectedPaths = {}
-for _, entry in ipairs(manifest.files) do
     table.insert(nextPaths, entry.path)
     affectedPaths[entry.path] = true
 end
@@ -360,12 +352,7 @@ local markerOk, markerError = writeTable(INSTALLING, {
 })
 if not markerOk then error("Cannot create installation marker: " .. tostring(markerError), 0) end
 
-if fs.exists(BACKUP) then fs.delete(BACKUP) end
-local newFiles = {}
-for _, entry in ipairs(manifest.files) do
-    local path = entry.path
-    newFiles[path] = true
-    local staged = fs.combine(STAGE, path)
+local function installDownloaded(path)
     local destination = "/" .. path
     local backup = fs.combine(BACKUP, path)
     local parent = fs.getDir(destination)
@@ -373,10 +360,37 @@ for _, entry in ipairs(manifest.files) do
     if fs.exists(destination) then
         local backupParent = fs.getDir(backup)
         if backupParent ~= "" and not fs.exists(backupParent) then fs.makeDir(backupParent) end
-        fs.copy(destination, backup)
-        fs.delete(destination)
+        fs.move(destination, backup)
     end
-    fs.move(staged, destination)
+    fs.move(FILE_TEMP, destination)
+end
+
+for index, entry in ipairs(manifest.files) do
+    write(("Downloading %d/%d %s... "):format(index, #manifest.files, entry.path))
+    local fileNonce = nonce("file:" .. index)
+    rednet.send(serverId, {
+        type = "GET_FILE", nonce = fileNonce, project = PROJECT, target = TARGET, path = entry.path,
+    }, PROTOCOL)
+    local response, fileError = receiveFrom(serverId, "FILE", fileNonce)
+    if not response then error("Download failed: " .. tostring(fileError), 0) end
+    if response.release ~= manifest.release or response.path ~= entry.path
+        or type(response.contents) ~= "string" or #response.contents ~= entry.size then
+        error("Deployment changed during download; retry after uploads settle", 0)
+    end
+    if entry.path:sub(-4) == ".lua" then
+        local chunk, syntaxError = load(response.contents, "@/" .. entry.path, "t", _ENV)
+        if not chunk then error(("Invalid %s: %s"):format(entry.path, syntaxError), 0) end
+    end
+    local wrote, writeError = stageFile(response.contents)
+    if not wrote then error(("Cannot stage %s: %s"):format(entry.path, tostring(writeError)), 0) end
+    installDownloaded(entry.path)
+    print("ok")
+end
+
+local newFiles = {}
+for _, entry in ipairs(manifest.files) do
+    local path = entry.path
+    newFiles[path] = true
 end
 for _, path in ipairs(saved and saved.files or {}) do
     if not newFiles[path] then
@@ -385,7 +399,7 @@ for _, path in ipairs(saved and saved.files or {}) do
             local backup = fs.combine(BACKUP, path)
             local backupParent = fs.getDir(backup)
             if backupParent ~= "" and not fs.exists(backupParent) then fs.makeDir(backupParent) end
-            fs.copy(destination, backup)
+            fs.move(destination, backup)
             fs.delete(destination)
         end
     end
@@ -402,6 +416,7 @@ local stateOk, stateError = writeTable(DEPLOYMENT_STATE, {
 })
 if not stateOk then error("Cannot save deployment state: " .. tostring(stateError), 0) end
 fs.delete(STAGE)
+if fs.exists(FILE_TEMP) then fs.delete(FILE_TEMP) end
 fs.delete(INSTALLING)
 if fs.exists(BACKUP) then fs.delete(BACKUP) end
 print(("Installed %s/%s revision %s."):format(PROJECT, TARGET, manifest.release))

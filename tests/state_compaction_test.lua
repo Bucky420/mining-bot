@@ -47,6 +47,14 @@ data.currentJob = {
         plan = { { 1, 2, 70, "g", "-", 0, 1, 0, "-", 0, 0 } },
     },
 }
+data.lastJob = {
+    id = "old-survey", type = "FARM_SERVICE", status = "FAILED",
+    progress = {
+        phase = "SURVEY", surveyIndex = 43, surveyRouteKey = "sweep-v4-3d",
+        surfaceColumns = { ["9:9"] = "70,g,1,-,0,0,0" },
+        surfaceNames = { "minecraft:grass_block" }, scanTiles = { { "9:9" } },
+    },
+}
 data.reportOutbox = {
     {
         type = "FARM_MAP",
@@ -77,8 +85,9 @@ local progress = reloaded.currentJob.progress
 assert(progress.surfaceColumns["1:2"] == "70,g,1,-,0,0,0")
 assert(progress.navAllowed["1:2"] == true and progress.navAllowed["2:2"] == nil)
 assert(progress.plan[1][1] == 1 and progress.plan[1][4] == "g")
-assert(reloaded.reportOutbox[1].payload.delta[1].name == "minecraft:grass_block")
-assert(reloaded.reportOutbox[1].payload.delta[1].occupantClass == "crop"
-    and reloaded.reportOutbox[1].payload.delta[1].occupantY == 71)
+assert(#reloaded.reportOutbox == 0, "obsolete survey reports survived state reload")
+assert(reloaded.lastJob.progress.surveyIndex == nil
+    and next(reloaded.lastJob.progress.surfaceColumns) == nil,
+    "obsolete persisted survey progression survived state reload")
 
 print("state compaction tests passed")

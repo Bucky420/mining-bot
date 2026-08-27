@@ -211,6 +211,56 @@ function storage.writeFarm(farmKey, farmMap, indexEntry)
     }
 end
 
+function storage.readValue(indexEntry, validator)
+    local volume, path = resolve(indexEntry, storage.discover())
+    if not volume then return nil, "TERRAIN_VOLUME_MISSING" end
+    local value = readTable(path) or readTable(path .. ".previous")
+    if not value or validator and not validator(value) then return nil, "STORAGE_FILE_INVALID" end
+    return value
+end
+
+function storage.writeValue(file, value, indexEntry, validator)
+    local volumes = storage.discover()
+    local volume, path = resolve(indexEntry, volumes)
+    if indexEntry and not volume then return nil, "TERRAIN_VOLUME_MISSING" end
+    if not volume then
+        for _, candidate in pairs(volumes) do
+            if not volume or candidate.free > volume.free then volume = candidate end
+        end
+        if not volume then return nil, "NO_COMPUTER_STORAGE_VOLUME" end
+        path = fs.combine(volume.mount, file)
+    end
+    local ok, writeError = atomicWrite(path, value)
+    if not ok then return nil, writeError end
+    local installed = readTable(path)
+    if not installed or validator and not validator(installed) then
+        return nil, "INSTALLED_STORAGE_FILE_INVALID"
+    end
+    return {
+        volumeId = volume.id,
+        file = file,
+        updatedAt = os.epoch("utc"),
+    }
+end
+
+function storage.stats(maximumDrives)
+    local volumes, connected, capacity, free = storage.describe(), 0, 0, 0
+    for _, volume in ipairs(volumes) do
+        connected = connected + 1
+        capacity = capacity + (tonumber(volume.capacity) or 0)
+        free = free + (tonumber(volume.free) or 0)
+    end
+    local used = math.max(0, capacity - free)
+    return {
+        connected = connected,
+        maximum = math.max(1, math.floor(tonumber(maximumDrives) or 8)),
+        capacity = capacity,
+        free = free,
+        used = used,
+        percent = capacity > 0 and used / capacity * 100 or 0,
+    }
+end
+
 function storage.describe()
     local result = {}
     for _, volume in pairs(storage.discover()) do

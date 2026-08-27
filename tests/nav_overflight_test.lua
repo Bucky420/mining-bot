@@ -109,4 +109,22 @@ ok, reason = nav.overflyXYZ(2, 5, 0, { maximumY = 12 })
 assert(not ok and reason == "OVERFLIGHT_ASCENT_BLOCKED", tostring(reason))
 assert(#successfulPositions == 0, "blocked overflight should not guess a route")
 
+data.position, data.heading, data.movesSinceGps = { x = 0, y = 5, z = 0 }, "east", 0
+successfulPositions, occupied = {}, {}
+ok, reason = nav.followWaypoints({
+    { x = 0, y = 6, z = 0 },
+    { x = 1, y = 6, z = 0 },
+    { x = 1, y = 5, z = 0 },
+})
+assert(ok, tostring(reason))
+assert(data.position.x == 1 and data.position.y == 5 and data.position.z == 0,
+    "3D waypoint route did not execute exactly")
+
+data.position, data.heading, data.movesSinceGps = { x = 0, y = 5, z = 0 }, "east", 0
+successfulPositions = {}
+occupied = { [key(1, 5, 0)] = true }
+ok, reason = nav.gotoXYZ(2, 5, 0)
+assert(not ok and reason == "BLOCK", "normal navigation should not invent an overflight route")
+assert(#successfulPositions == 0, "blocked direct navigation moved without a planned path")
+
 print("navigation overflight test passed")

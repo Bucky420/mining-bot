@@ -71,6 +71,32 @@ assert(invalid == nil and invalidError == "INVALID_CONTROLLER_ROUTE")
 
 responses = {
     { 9, {
+        type = "ROUTE_RESPONSE", requestId = "route-3d-request", ok = true,
+        controllerBootId = "boot", reservationId = "route-4-1000",
+        reservationExpiresAt = 31000,
+        path = { { x = 1, y = 70, z = 0 }, { x = 1, y = 71, z = 0 } },
+    } },
+}
+local route3D, route3DError, reservationId = network.requestRoute(
+    "world", { x = 0, y = 70, z = 0 }, { x = 1, y = 71, z = 0 }
+)
+assert(route3D and not route3DError and reservationId == "route-4-1000" and #route3D == 2)
+assert(lastSent.message.type == "ROUTE_REQUEST" and lastSent.message.mapId == "world")
+
+responses = {
+    { 9, {
+        type = "ROUTE_RESPONSE", requestId = "route-3d-request", ok = true,
+        controllerBootId = "boot", reservationId = "bad", reservationExpiresAt = 31000,
+        path = { { x = 1, z = 0 } },
+    } },
+}
+local invalid3D, invalid3DError = network.requestRoute(
+    "world", { x = 0, y = 70, z = 0 }, { x = 1, y = 70, z = 0 }
+)
+assert(invalid3D == nil and invalid3DError == "INVALID_CONTROLLER_3D_ROUTE")
+
+responses = {
+    { 9, {
         type = "FARM_TERRAIN_BEGIN", requestId = "farm-terrain-request", ok = true,
         revision = 8, chunkCount = 2, cellCount = 2,
     } },
@@ -112,5 +138,30 @@ responses = {
 reported, reportError = network.flushReports(true)
 assert(reported and not reportError and #stateData.reportOutbox == 0,
     "queued report was not removed after acknowledgement")
+
+reported, reportError = network.reportFarmMap({ farmId = "farm", revision = 11, delta = {} })
+assert(reported and not reportError and #stateData.reportOutbox == 0,
+    "live farm map report was persisted on the turtle")
+assert(lastSent.message.type == "FARM_MAP" and lastSent.message.payload.revision == 11)
+
+reported, reportError = network.reportFarmSpatial("farm", {
+    ["0:0:0"] = { { x = 0, y = 0, z = 0, name = "minecraft:air" } },
+}, 12, { x = 0, y = 0, z = 0 }, 8, 2)
+assert(reported and not reportError and #stateData.reportOutbox == 0,
+    "live spatial report was persisted on the turtle")
+assert(lastSent.message.type == "FARM_3D_MAP"
+    and lastSent.message.payload.chunks["0:0:0"], "spatial chunk was not published directly")
+
+responses = {
+    { 9, {
+        type = "FARM_3D_SURVEY_PLAN_RESPONSE", requestId = "survey-plan-request",
+        ok = true, version = 2, poses = { { x = 8, y = 75, z = 0 } },
+    } },
+}
+local poses, planError = network.requestFarmSurveyPlan(
+    "farm", { x = 0, z = 0 }, 70, 16, 8, { x = 0, y = 75, z = 0 }, 2
+)
+assert(poses and not planError and #poses == 1 and poses[1].x == 8,
+    "controller survey pose plan was not accepted")
 
 print("network terrain tests passed")

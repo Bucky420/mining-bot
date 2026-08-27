@@ -11,6 +11,7 @@ return {
         { source = "lib_network.lua", path = "lib/network.lua" },
         { source = "lib_jobs.lua", path = "lib/jobs.lua" },
         { source = "lib_scanner.lua", path = "lib/scanner.lua" },
+        { source = "lib_spatial_map.lua", path = "lib/spatial_map.lua" },
         { source = "lib_farm_terrain.lua", path = "lib/farm_terrain.lua" },
         { source = "lib_station.lua", path = "lib/station.lua" },
         { source = "jobs_travel.lua", path = "jobs/travel.lua" },

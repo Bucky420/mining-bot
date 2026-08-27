@@ -5,6 +5,17 @@ local util = require("lib.util")
 
 local network = {}
 local deferredMessages = {}
+local MAX_DEFERRED_MESSAGES = 64
+
+local function deferMessage(sender, message)
+    if not sender or type(message) ~= "table" then return end
+    if #deferredMessages >= MAX_DEFERRED_MESSAGES then table.remove(deferredMessages, 1) end
+    deferredMessages[#deferredMessages + 1] = { sender = sender, message = message }
+end
+
+local function yieldNetwork()
+    if type(sleep) == "function" then sleep(0) end
+end
 local actionableStatuses = {
     NEEDS_FUEL = true,
     NEEDS_INVENTORY_SPACE = true,
@@ -33,6 +44,7 @@ local function sendReport(controllerId, message)
     rednet.send(controllerId, message, config.network.protocol)
     local deadline = util.now() + 2000
     while util.now() < deadline do
+        yieldNetwork()
         local sender, response = rednet.receive(
             config.network.protocol,
             math.max(0, (deadline - util.now()) / 1000)
@@ -43,7 +55,7 @@ local function sendReport(controllerId, message)
             return true
         end
         if sender and type(response) == "table" then
-            table.insert(deferredMessages, { sender = sender, message = response })
+            deferMessage(sender, response)
         end
     end
     return false, "REPORT_NOT_ACKNOWLEDGED"
@@ -102,6 +114,9 @@ function network.report(eventType, payload)
     local data = state.get()
     local controllerId = data.controllerId or config.network.controllerId
     if not controllerId then return false, "NO_CONTROLLER_CONFIGURED" end
+    if eventType == "FARM_MAP" and network.reportBacklogFull() then
+        return true, "QUEUED_IN_RAM"
+    end
     if eventType ~= "FARM_MAP" and network.reportBacklogFull() then
         return false, "REPORT_BACKLOG_LIMIT_REACHED"
     end
@@ -160,11 +175,12 @@ function network.announce(resync, attachedOnly)
         status = data.status,
         statusDetail = data.statusDetail,
         position = data.position,
+        positionVerifiedAt = data.positionVerifiedAt,
         heading = data.heading,
         navigationReady = data.navigationReady == true,
         navigationError = data.navigationError,
         home = data.home,
-        label = os.getComputerLabel(),
+        label = os.getComputerLabel and os.getComputerLabel() or nil,
         release = installedRelease(),
         sentAt = util.now(),
         resync = resync == true,
@@ -206,13 +222,20 @@ end
 
 local function receiveControllerMessage(controllerId, deadline)
     while util.now() < deadline do
+        if type(sleep) == "function" then sleep(0) end
+        for index, deferred in ipairs(deferredMessages) do
+            if deferred.sender == controllerId and type(deferred.message) == "table" then
+                table.remove(deferredMessages, index)
+                return deferred.message
+            end
+        end
         local sender, message = rednet.receive(
             config.network.protocol,
             math.max(0, (deadline - util.now()) / 1000)
         )
         if sender == controllerId and type(message) == "table" then return message end
         if sender and type(message) == "table" then
-            deferredMessages[#deferredMessages + 1] = { sender = sender, message = message }
+            deferMessage(sender, message)
         end
     end
     return nil
@@ -233,6 +256,7 @@ function network.requestFarmRoute(farmId, start, target, heading, minRevision)
         }, config.network.protocol)
         local deadline = util.now() + 3000
         while util.now() < deadline do
+            yieldNetwork()
             local message = receiveControllerMessage(controllerId, deadline)
             if not message then break end
             if message.type == "FARM_ROUTE_RESPONSE" and message.requestId == requestId then
@@ -254,10 +278,72 @@ function network.requestFarmRoute(farmId, start, target, heading, minRevision)
                 end
                 return message.path, nil, message.mapRevision
             end
-            deferredMessages[#deferredMessages + 1] = { sender = controllerId, message = message }
+            deferMessage(controllerId, message)
         end
     end
     return nil, "CONTROLLER_ROUTE_TIMEOUT"
+end
+
+function network.requestRoute(mapId, start, target)
+    local opened, openError = openAttachedModems()
+    if not opened then return nil, openError end
+    local data = state.get()
+    local controllerId = data.controllerId or config.network.controllerId
+    if not controllerId then return nil, "NO_CONTROLLER_CONFIGURED" end
+    local announced, announceError = network.announce(false, true)
+    if not announced then return nil, announceError end
+    local requestId = util.makeId("route-3d")
+    rednet.send(controllerId, {
+        type = "ROUTE_REQUEST", requestId = requestId, mapId = mapId or "world",
+        start = util.detachedCopy(start), target = util.detachedCopy(target),
+    }, config.network.protocol)
+    local deadline = util.now() + 10000
+    while util.now() < deadline do
+        yieldNetwork()
+        local message = receiveControllerMessage(controllerId, deadline)
+        if not message then break end
+        if message.type == "ROUTE_RESPONSE" and message.requestId == requestId then
+            if not message.ok then return nil, message.error or "CONTROLLER_ROUTE_REJECTED" end
+            if data.controllerBootId and message.controllerBootId ~= data.controllerBootId
+                or type(message.reservationId) ~= "string"
+                or type(message.reservationExpiresAt) ~= "number"
+                or type(message.path) ~= "table" or #message.path > 1024 then
+                return nil, "INVALID_CONTROLLER_3D_ROUTE"
+            end
+            local previous = start
+            for _, point in ipairs(message.path) do
+                if type(point) ~= "table" or type(point.x) ~= "number"
+                    or type(point.y) ~= "number" or type(point.z) ~= "number"
+                    or point.x ~= math.floor(point.x) or point.y ~= math.floor(point.y)
+                    or point.z ~= math.floor(point.z)
+                    or math.abs(point.x - previous.x) + math.abs(point.y - previous.y)
+                        + math.abs(point.z - previous.z) ~= 1 then
+                    return nil, "INVALID_CONTROLLER_3D_ROUTE"
+                end
+                previous = point
+            end
+            if previous.x ~= target.x or previous.y ~= target.y or previous.z ~= target.z then
+                return nil, "INCOMPLETE_CONTROLLER_3D_ROUTE"
+            end
+            return message.path, nil, message.reservationId
+        end
+        deferMessage(controllerId, message)
+    end
+    return nil, "CONTROLLER_3D_ROUTE_TIMEOUT"
+end
+
+function network.finishRoute(reservationId, blocked, point, block)
+    if type(reservationId) ~= "string" then return false end
+    local opened = openAttachedModems()
+    local controllerId = state.get().controllerId or config.network.controllerId
+    if not opened or not controllerId then return false end
+    rednet.send(controllerId, {
+        type = blocked and "ROUTE_BLOCKED" or "ROUTE_RELEASE",
+        reservationId = reservationId,
+        point = util.detachedCopy(point),
+        blockName = type(block) == "table" and block.name or nil,
+    }, config.network.protocol)
+    return true
 end
 
 function network.requestFarmTerrain(farmId, minRevision)
@@ -274,10 +360,11 @@ function network.requestFarmTerrain(farmId, minRevision)
         }, config.network.protocol)
         local deadline, metadata, chunks = util.now() + 10000, nil, {}
         while util.now() < deadline do
+            yieldNetwork()
             local message = receiveControllerMessage(controllerId, deadline)
             if not message then break end
             if message.requestId ~= requestId then
-                deferredMessages[#deferredMessages + 1] = { sender = controllerId, message = message }
+                deferMessage(controllerId, message)
             elseif message.type == "FARM_TERRAIN_RESPONSE" and not message.ok then
                 return nil, message.error or "CONTROLLER_TERRAIN_REJECTED"
             elseif message.type == "FARM_TERRAIN_BEGIN" then
@@ -314,14 +401,152 @@ function network.requestFarmTerrain(farmId, minRevision)
     return nil, "CONTROLLER_TERRAIN_TIMEOUT"
 end
 
+function network.requestFarmSpatial(farmId, chunks, minRevision)
+    local opened, openError = openAttachedModems()
+    if not opened then return nil, openError end
+    if type(farmId) ~= "string" or type(chunks) ~= "table" or #chunks < 1 or #chunks > 27 then
+        return nil, "INVALID_SPATIAL_REQUEST"
+    end
+    local data = state.get()
+    local controllerId = data.controllerId or config.network.controllerId
+    if not controllerId then return nil, "NO_CONTROLLER_CONFIGURED" end
+    local requestId = util.makeId("farm-3d")
+    rednet.send(controllerId, {
+        type = "FARM_3D_CHUNK_REQUEST", requestId = requestId, farmId = farmId,
+        chunks = util.detachedCopy(chunks), minRevision = minRevision,
+    }, config.network.protocol)
+    local deadline, received = util.now() + 5000, {}
+    while util.now() < deadline do
+        yieldNetwork()
+        local message = receiveControllerMessage(controllerId, deadline)
+        if not message then break end
+        if message.type == "FARM_3D_CHUNK_RESPONSE" and message.requestId == requestId then
+            if not message.ok then return nil, message.error or "SPATIAL_REQUEST_REJECTED" end
+            if type(message.chunkKey) ~= "string" then return nil, "INVALID_SPATIAL_RESPONSE" end
+            received[message.chunkKey] = message.missing and false or util.detachedCopy(message.chunk)
+            local count = 0
+            for _ in pairs(received) do count = count + 1 end
+            if count == #chunks then return received end
+        else
+            deferMessage(controllerId, message)
+        end
+    end
+    return nil, "SPATIAL_REQUEST_TIMEOUT"
+end
+
+function network.requestFarmSurveyPlan(farmId, center, baseY, radius, step, start, version)
+    local opened, openError = openAttachedModems()
+    if not opened then return nil, openError end
+    local controllerId = state.get().controllerId or config.network.controllerId
+    if not controllerId then return nil, "NO_CONTROLLER_CONFIGURED" end
+    local requestId = util.makeId("survey-plan")
+    rednet.send(controllerId, {
+        type = "FARM_3D_SURVEY_PLAN_REQUEST", requestId = requestId,
+        farmId = farmId, center = util.detachedCopy(center), baseY = baseY,
+        radius = radius, step = step, start = util.detachedCopy(start), version = version,
+    }, config.network.protocol)
+    local deadline = util.now() + 5000
+    while util.now() < deadline do
+        yieldNetwork()
+        local message = receiveControllerMessage(controllerId, deadline)
+        if not message then break end
+        if message.type == "FARM_3D_SURVEY_PLAN_RESPONSE" and message.requestId == requestId then
+            if not message.ok then return nil, message.error or "SURVEY_PLAN_REJECTED" end
+            if message.version ~= version or type(message.poses) ~= "table" or #message.poses > 1024 then
+                return nil, "INVALID_SURVEY_PLAN_RESPONSE"
+            end
+            local poses, seen = {}, {}
+            for _, pose in ipairs(message.poses) do
+                if type(pose) ~= "table" or type(pose.x) ~= "number" or pose.x ~= math.floor(pose.x)
+                    or type(pose.y) ~= "number" or pose.y ~= math.floor(pose.y)
+                    or type(pose.z) ~= "number" or pose.z ~= math.floor(pose.z)
+                    or (pose.x - center.x) ^ 2 + (pose.z - center.z) ^ 2 > radius * radius then
+                    return nil, "INVALID_SURVEY_PLAN_POSE"
+                end
+                local poseKey = ("%d:%d:%d"):format(pose.x, pose.y, pose.z)
+                if seen[poseKey] then return nil, "DUPLICATE_SURVEY_PLAN_POSE" end
+                seen[poseKey] = true
+                poses[#poses + 1] = util.detachedCopy(pose)
+            end
+            return poses
+        end
+        deferMessage(controllerId, message)
+    end
+    return nil, "SURVEY_PLAN_TIMEOUT"
+end
+
+function network.reportFarmSpatial(farmId, chunks, revision, origin, radius, version)
+    if type(farmId) ~= "string" or type(chunks) ~= "table" or type(origin) ~= "table"
+        or type(origin.x) ~= "number" or type(origin.y) ~= "number" or type(origin.z) ~= "number"
+        or type(radius) ~= "number" or type(version) ~= "number" then
+        return false, "INVALID_SPATIAL_REPORT"
+    end
+    local controllerId = state.get().controllerId or config.network.controllerId
+    if not controllerId then return true, "QUEUED_IN_RAM" end
+    local opened = openModems()
+    if not opened then return true, "RETAINED_IN_RAM" end
+    for chunkKey, cells in pairs(chunks) do
+        local sequence = state.get().nextReportSequence or 1
+        state.get().nextReportSequence = sequence + 1
+        rednet.send(controllerId, {
+            type = "FARM_3D_MAP",
+            messageId = ("spatial-%d-%d-%d"):format(os.getComputerID(), util.now(), sequence),
+            turtleId = os.getComputerID(),
+            status = state.get().status,
+            position = util.detachedCopy(state.get().position),
+            heading = state.get().heading,
+            positionVerifiedAt = state.get().positionVerifiedAt,
+            payload = {
+                farmId = farmId,
+                revision = revision or 0,
+                verifiedAt = util.now(),
+                version = version,
+                origin = util.detachedCopy(origin),
+                radius = radius,
+                chunks = { [chunkKey] = util.detachedCopy(cells) },
+            },
+            sentAt = util.now(),
+        }, config.network.protocol)
+    end
+    return true
+end
+
+function network.reportFarmMap(payload)
+    local data = state.get()
+    local controllerId = data.controllerId or config.network.controllerId
+    if not controllerId then return true, "RETAINED_IN_RAM" end
+    local opened = openModems()
+    if not opened then return true, "RETAINED_IN_RAM" end
+    local sequence = data.nextReportSequence or 1
+    data.nextReportSequence = sequence + 1
+    rednet.send(controllerId, {
+        type = "FARM_MAP",
+        messageId = ("farm-map-%d-%d-%d"):format(os.getComputerID(), util.now(), sequence),
+        turtleId = os.getComputerID(),
+        status = data.status,
+        position = util.detachedCopy(data.position),
+        heading = data.heading,
+        positionVerifiedAt = data.positionVerifiedAt,
+        payload = util.detachedCopy(payload),
+        sentAt = util.now(),
+    }, config.network.protocol)
+    return true
+end
+
 function network.receiveJob(timeout, attachedOnly)
     local ok = attachedOnly and openAttachedModems() or openModems()
     if not ok then return nil end
     local sender, message
-    if #deferredMessages > 0 then
-        local deferred = table.remove(deferredMessages, 1)
-        sender, message = deferred.sender, deferred.message
-    else
+    for index, deferred in ipairs(deferredMessages) do
+        local messageType = type(deferred.message) == "table" and deferred.message.type
+        if messageType == "CONTROLLER_HELLO" or messageType == "REGISTRATION_REQUIRED"
+            or messageType == "CONTROL_JOB" or messageType == "ASSIGN_JOB" then
+            sender, message = deferred.sender, deferred.message
+            table.remove(deferredMessages, index)
+            break
+        end
+    end
+    if not sender then
         sender, message = rednet.receive(config.network.protocol, timeout)
     end
     if not sender or type(message) ~= "table" then
@@ -370,6 +595,10 @@ function network.receiveJob(timeout, attachedOnly)
         network.announce(true, attachedOnly)
         return nil
     end
+    if message.type == "REPORT_ACK" and type(message.messageId) == "string" then
+        removeReport(message.messageId)
+        return nil
+    end
     local controllerId = state.get().controllerId or config.network.controllerId
     if controllerId and sender ~= controllerId then
         return nil, "UNAUTHORIZED_CONTROLLER"
@@ -383,7 +612,10 @@ function network.receiveJob(timeout, attachedOnly)
             or message.action == "farm_cancel") then
         return nil, nil, sender, message.action, message.release, message.parameters
     end
-    if message.type ~= "ASSIGN_JOB" then return nil end
+    if message.type ~= "ASSIGN_JOB" then
+        deferMessage(sender, message)
+        return nil
+    end
     if type(message.job) ~= "table" or type(message.job.type) ~= "string" then
         return nil, "INVALID_JOB_MESSAGE"
     end

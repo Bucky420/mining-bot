@@ -28,7 +28,9 @@ function travel.run(job, framework)
         if not framework.checkpoint(job, "Travel started") then return false, "JOB_CANCELLED" end
     end
 
-    local ok, reason, block = nav.gotoXYZ(destination.x, destination.y, destination.z, {
+    local ok, reason, block = nav.routeXYZ(
+        parameters.mapId or parameters.farmId or "world",
+        destination.x, destination.y, destination.z, {
         shouldContinue = function() return not framework.isCancellationRequested(job) end,
     })
     if not ok then

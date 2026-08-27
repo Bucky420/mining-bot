@@ -65,13 +65,20 @@ function scanner.scan(radius, blockFilter)
     local device = findScanner()
     if not device then return nil, "GEO_SCANNER_PERIPHERAL_NOT_FOUND" end
 
-    local blocks, scanError
-    if type(device.scan) == "function" then
-        blocks, scanError = device.scan(radius)
-    elseif type(device.scanBlocks) == "function" then
-        blocks, scanError = device.scanBlocks(radius)
-    else
+    local scanMethod = type(device.scan) == "function" and device.scan or device.scanBlocks
+    if type(scanMethod) ~= "function" then
         return nil, "GEO_SCANNER_API_UNSUPPORTED"
+    end
+    local blocks, scanError
+    local attempts = math.max(1, math.floor(config.scanner.retryAttempts or 1))
+    for attempt = 1, attempts do
+        local called, result, resultError = pcall(scanMethod, radius)
+        if called and type(result) == "table" then
+            blocks = result
+            break
+        end
+        scanError = called and resultError or result
+        if attempt < attempts then sleep(config.scanner.retryDelay or 1) end
     end
     if type(blocks) ~= "table" then return nil, scanError or "GEO_SCAN_FAILED" end
 
@@ -115,27 +122,46 @@ function scanner.scan(radius, blockFilter)
         if coordinateMode == "absolute" then
             x, y, z = x - origin.x, y - origin.y, z - origin.z
         end
-        local absoluteX, absoluteY, absoluteZ = origin.x + x, origin.y + y, origin.z + z
-        local key = ("%d:%d:%d"):format(absoluteX, absoluteY, absoluteZ)
-        if occupied[key] then return nil, "GEO_SCAN_DUPLICATE_COORDINATE" end
-        occupied[key] = block.name
-        table.insert(relativeBlocks, copyBlock(block, x, y, z))
-        table.insert(normalizedBlocks, copyBlock(block, absoluteX, absoluteY, absoluteZ))
-        counts[block.name] = (counts[block.name] or 0) + 1
-        if type(block.name) == "string"
-            and block.name:find(config.scanner.chestNameContains, 1, true) then
-            table.insert(chestCandidates, copyBlock(block, absoluteX, absoluteY, absoluteZ))
+        if x * x + y * y + z * z <= radius * radius then
+            local absoluteX, absoluteY, absoluteZ = origin.x + x, origin.y + y, origin.z + z
+            local key = ("%d:%d:%d"):format(absoluteX, absoluteY, absoluteZ)
+            if occupied[key] then return nil, "GEO_SCAN_DUPLICATE_COORDINATE" end
+            occupied[key] = block.name
+            table.insert(relativeBlocks, copyBlock(block, x, y, z))
+            table.insert(normalizedBlocks, copyBlock(block, absoluteX, absoluteY, absoluteZ))
+            counts[block.name] = (counts[block.name] or 0) + 1
+            if type(block.name) == "string"
+                and block.name:find(config.scanner.chestNameContains, 1, true) then
+                table.insert(chestCandidates, copyBlock(block, absoluteX, absoluteY, absoluteZ))
+            end
+            if type(blockFilter) == "string" and block.name == blockFilter then
+                table.insert(matches, copyBlock(block, absoluteX, absoluteY, absoluteZ))
+            end
+            local taggedCrop = hasTag(block.tags, "minecraft:crops")
+                or hasTag(block.tags, "c:crops") or hasTag(block.tags, "forge:crops")
+            local configuredCrop = type(block.name) == "string"
+                and type(config.scanner.cropNameContains) == "string"
+                and block.name:find(config.scanner.cropNameContains, 1, true)
+            if taggedCrop or configuredCrop then
+                table.insert(farmCandidates, copyBlock(block, absoluteX, absoluteY, absoluteZ))
+            end
         end
-        if type(blockFilter) == "string" and block.name == blockFilter then
-            table.insert(matches, copyBlock(block, absoluteX, absoluteY, absoluteZ))
-        end
-        local taggedCrop = hasTag(block.tags, "minecraft:crops")
-            or hasTag(block.tags, "c:crops") or hasTag(block.tags, "forge:crops")
-        local configuredCrop = type(block.name) == "string"
-            and type(config.scanner.cropNameContains) == "string"
-            and block.name:find(config.scanner.cropNameContains, 1, true)
-        if taggedCrop or configuredCrop then
-            table.insert(farmCandidates, copyBlock(block, absoluteX, absoluteY, absoluteZ))
+    end
+    -- Advanced Peripherals omits air blocks. Fill only the exact scanned
+    -- sphere so known air can be distinguished from unknown cube corners.
+    for dx = -radius, radius do
+        for dy = -radius, radius do
+            for dz = -radius, radius do
+                if dx * dx + dy * dy + dz * dz <= radius * radius then
+                    local x, y, z = origin.x + dx, origin.y + dy, origin.z + dz
+                    local absoluteKey = ("%d:%d:%d"):format(x, y, z)
+                    if not occupied[absoluteKey] then
+                        normalizedBlocks[#normalizedBlocks + 1] = {
+                            x = x, y = y, z = z, name = "minecraft:air",
+                        }
+                    end
+                end
+            end
         end
     end
     for _, chest in ipairs(chestCandidates) do
@@ -151,6 +177,7 @@ function scanner.scan(radius, blockFilter)
         end
     end
     return {
+        version = config.scanner.surveyVersion,
         origin = origin,
         radius = radius,
         coordinateMode = coordinateMode,

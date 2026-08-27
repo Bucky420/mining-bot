@@ -4,6 +4,7 @@ local map = require("lib.map")
 local nav = require("lib.nav")
 local network = require("lib.network")
 local scanner = require("lib.scanner")
+local spatial = require("lib.spatial_map")
 local state = require("lib.state")
 local station = require("lib.station")
 local terrain = require("lib.farm_terrain")
@@ -19,6 +20,8 @@ local classCodes = {
     sand = "s", stone = "t", crop = "c", unknown = "u", hard = "h",
 }
 local codeClasses = {}
+local surveySpatialMap, surveySpatialKey, surveyScanCenters = nil, nil, {}
+local surveyRuntimePlan, surveyRuntimeIndex, surveyDeferred, surveyVisited = nil, 1, {}, {}
 for name, code in pairs(classCodes) do codeClasses[code] = name end
 local vectors = {
     north = { x = 0, z = -1 },
@@ -102,186 +105,15 @@ local function findAnchor(job, framework)
     return candidate
 end
 
-local function plannedPath(progress, start, target)
-    if type(progress.navAllowed) ~= "table" then return nil end
-    if start.x == target.x and start.z == target.z then return {} end
-    if not progress.navAllowed[key(target.x, target.z)] then return nil end
-    return terrain.turnEfficientPath(progress.navAllowed, start, target, nav.getHeading(), 2)
-end
-
-local opposite = { north = "south", east = "west", south = "north", west = "east" }
-
-local function orderedDirections(position, target)
-    local result = { "north", "east", "south", "west" }
-    table.sort(result, function(a, b)
-        local av, bv = vectors[a], vectors[b]
-        local ad = math.abs(position.x + av.x - target.x) + math.abs(position.z + av.z - target.z)
-        local bd = math.abs(position.x + bv.x - target.x) + math.abs(position.z + bv.z - target.z)
-        return ad == bd and a < b or ad < bd
-    end)
-    return result
-end
-
-local function insideNavigationBoundary(progress, x, z)
-    return terrain.inRadius(progress.anchor.x, progress.anchor.z, x, z, progress.radius + 3)
-end
-
-local function riseThroughCanopy(progress, cruiseY, target, continueRoute, maximumVisits)
-    local visited, visits = {}, 0
-    local options = {
-        shouldContinue = continueRoute,
-        routeOrder = { "y" },
-    }
-    local function search()
-        if not continueRoute() then return false, "JOB_CANCELLED" end
-        local current = nav.getPosition()
-        local raised, raiseError = nav.gotoXYZ(current.x, cruiseY, current.z, options)
-        if raised then return true end
-        if raiseError ~= "BLOCK" then return false, raiseError end
-        current = nav.getPosition()
-        local currentKey = ("%d:%d:%d"):format(current.x, current.y, current.z)
-        if visited[currentKey] or visits >= maximumVisits then return false, "CANOPY_ESCAPE_EXHAUSTED" end
-        visited[currentKey], visits = true, visits + 1
-        for _, direction in ipairs(orderedDirections(current, target)) do
-            local vector = vectors[direction]
-            local nextX, nextZ = current.x + vector.x, current.z + vector.z
-            local nextKey = ("%d:%d:%d"):format(nextX, current.y, nextZ)
-            if not visited[nextKey] and insideNavigationBoundary(progress, nextX, nextZ) then
-                local faced, faceError = nav.face(direction)
-                if not faced then return false, faceError end
-                local blocked = turtle.inspect()
-                if not blocked then
-                    local parent = nav.getPosition()
-                    local moved, moveError = nav.forward(options)
-                    if moved then
-                        local found, escapeError = search()
-                        if found then return true end
-                        local descended, descendError = nav.gotoXYZ(
-                            nav.getPosition().x, parent.y, nav.getPosition().z,
-                            { routeOrder = { "y" } }
-                        )
-                        if not descended then
-                            return false, "CANOPY_BACKTRACK_HEIGHT_FAILED: " .. tostring(descendError)
-                        end
-                        local returnedFace, returnedFaceError = nav.face(opposite[direction])
-                        if not returnedFace then return false, returnedFaceError end
-                        local returned, returnError = nav.forward()
-                        if not returned then
-                            return false, "CANOPY_BACKTRACK_FAILED: " .. tostring(returnError)
-                        end
-                        if escapeError == "JOB_CANCELLED" then return false, escapeError end
-                    elseif moveError == "JOB_CANCELLED" then
-                        return false, moveError
-                    end
-                end
-            end
-        end
-        return false, "CANOPY_ESCAPE_EXHAUSTED"
-    end
-    return search()
-end
-
 local function travelCruise(progress, x, y, z, job, framework, ignoreCancellation)
     local options = {
         shouldContinue = function()
             return ignoreCancellation == true or shouldContinue(job, framework)
         end,
         routeOrder = { "y", "x", "z" },
+        maximumY = progress.baseY + 5 + config.farming.maxOverflightRise,
     }
-    local position = nav.getPosition()
-    if position.y == y and math.abs(position.x - x) + math.abs(position.z - z) == 1 then
-        return nav.gotoXYZ(x, y, z, {
-            shouldContinue = options.shouldContinue,
-            routeOrder = { "x", "z", "y" },
-        })
-    end
-    local cruiseY = progress.baseY + 5
-    if position.y < cruiseY then
-        local raised, raiseError = riseThroughCanopy(
-            progress, cruiseY, { x = x, z = z }, options.shouldContinue, 64
-        )
-        if not raised then return false, raiseError end
-    end
-    local crossed, crossError
-    if progress.navAllowed then
-        for _ = 1, 4 do
-            local current = nav.getPosition()
-            local path = plannedPath(progress, current, { x = x, z = z })
-            if not path then break end
-            crossed = true
-            for _, point in ipairs(path) do
-                crossed, crossError = nav.gotoXYZ(point.x, cruiseY, point.z, {
-                    shouldContinue = options.shouldContinue,
-                    routeOrder = { "x", "z", "y" },
-                })
-                if not crossed then
-                    progress.navAllowed[key(point.x, point.z)] = false
-                    break
-                end
-            end
-            if crossed then break end
-        end
-        if not crossed then
-            local route, routeError, routeRevision = network.requestFarmRoute(
-                progress.farm and progress.farm.id,
-                nav.getPosition(), { x = x, z = z }, nav.getHeading(), progress.farmRevision
-            )
-            if route then
-                crossed = true
-                progress.controllerRouteRevision = routeRevision
-                for _, point in ipairs(route) do
-                    crossed, crossError = nav.gotoXYZ(point.x, cruiseY, point.z, {
-                        shouldContinue = options.shouldContinue,
-                        routeOrder = { "x", "z", "y" },
-                    })
-                    if not crossed then
-                        progress.navAllowed[key(point.x, point.z)] = false
-                        break
-                    end
-                end
-            else
-                crossError = routeError
-            end
-        end
-        if not crossed then
-            crossed, crossError = nav.overflyXYZ(x, y, z, {
-                shouldContinue = options.shouldContinue,
-                maximumY = cruiseY + config.farming.maxOverflightRise,
-            })
-        end
-    else
-        if progress.farm then
-            local route, routeError, routeRevision = network.requestFarmRoute(
-                progress.farm.id, nav.getPosition(), { x = x, z = z }, nav.getHeading(),
-                progress.farmRevision
-            )
-            if route then
-                crossed = true
-                progress.controllerRouteRevision = routeRevision
-                for _, point in ipairs(route) do
-                    crossed, crossError = nav.gotoXYZ(point.x, cruiseY, point.z, {
-                        shouldContinue = options.shouldContinue,
-                        routeOrder = { "x", "z", "y" },
-                    })
-                    if not crossed then break end
-                end
-            else
-                crossError = routeError
-            end
-        else
-            crossed, crossError = nav.gotoXYZ(x, cruiseY, z, {
-                shouldContinue = options.shouldContinue, routeOrder = { "x", "z", "y" },
-            })
-        end
-        if not crossed then
-            crossed, crossError = nav.overflyXYZ(x, y, z, {
-                shouldContinue = options.shouldContinue,
-                maximumY = cruiseY + config.farming.maxOverflightRise,
-            })
-        end
-    end
-    if not crossed then return false, crossError or "NO_SAFE_ROUTE_AROUND_BOUNDARY" end
-    return nav.gotoXYZ(x, y, z, options)
+    return nav.routeXYZ(progress.farm and progress.farm.id or "world", x, y, z, options)
 end
 
 local function arriveAnchor(progress, job, framework)
@@ -578,7 +410,7 @@ end
 
 local function reportMap(progress, job, delta)
     progress.farmRevision = (progress.farmRevision or 0) + 1
-    return network.report("FARM_MAP", {
+    return network.reportFarmMap({
         farmId = progress.farm.id,
         revision = progress.farmRevision,
         jobId = job.id,
@@ -607,14 +439,13 @@ end
 local function streamSurveyDelta(progress, job, delta)
     local restored, restoreError = inventory.ensureModem()
     if not restored then return false, "SURVEY_MODEM_RESTORE_FAILED: " .. tostring(restoreError) end
-    network.flushReports(true)
     return reportMapChunks(progress, job, delta)
 end
 
 local function surveyPoints(progress)
-    -- Six-block spacing keeps the next center inside the previously scanned
-    -- safe area even when the scanner is several blocks above the surface.
-    local step = math.max(1, config.scanner.maxRadius - 2)
+    -- Radius-eight scans at baseY+5 cover the ground continuously with this
+    -- spacing while avoiding the old six-block overlap.
+    local step = math.max(1, math.min(config.scanner.maxRadius, config.scanner.surveyStep))
     return terrain.surveySweepPoints(
         { x = progress.anchor.x, z = progress.anchor.z },
         progress.radius,
@@ -624,94 +455,261 @@ local function surveyPoints(progress)
 end
 
 local function surveyRouteKey(progress)
-    return ("sweep-v3:%d:%d:%d:%d:%d:%d"):format(
+    return ("sweep-v4-3d:%d:%d:%d:%d:%d:%d"):format(
         progress.anchor.x,
         progress.anchor.z,
         progress.baseY,
         progress.radius,
         config.scanner.maxRadius,
-        math.max(1, config.scanner.maxRadius - 2)
+        math.max(1, math.min(config.scanner.maxRadius, config.scanner.surveyStep))
     )
+end
+
+local function observeSurveyScan(progress, result)
+    local observed, observeError = surveySpatialMap:observe(result, nav.getPosition())
+    if not observed then return false, observeError end
+    surveyScanCenters[("%d:%d:%d"):format(
+        result.origin.x, result.origin.y, result.origin.z
+    )] = true
+    return true
+end
+
+local function cachedSpatialScan(point, progress)
+    local points = {}
+    for x = point.x - config.scanner.maxRadius, point.x + config.scanner.maxRadius, 16 do
+        for y = point.y - config.scanner.maxRadius, point.y + config.scanner.maxRadius, 16 do
+            for z = point.z - config.scanner.maxRadius, point.z + config.scanner.maxRadius, 16 do
+                points[#points + 1] = { x = x, y = y, z = z }
+            end
+        end
+    end
+    local blocks, seen = {}, {}
+    for _, chunkKey in ipairs(surveySpatialMap:chunkKeys(points)) do
+        for _, block in ipairs(surveySpatialMap:chunkCells(chunkKey)) do
+            local blockKey = ("%d:%d:%d"):format(block.x, block.y, block.z)
+            if not seen[blockKey] then seen[blockKey] = true blocks[#blocks + 1] = block end
+        end
+    end
+    if #blocks == 0 then return nil end
+    return { origin = point, radius = config.scanner.maxRadius, blocks = blocks }
+end
+
+local function reportSpatialScan(progress, result)
+    local chunks = {}
+    for _, chunkKey in ipairs(surveySpatialMap:chunkKeys(result.blocks)) do
+        chunks[chunkKey] = surveySpatialMap:chunkCells(chunkKey)
+    end
+    if next(chunks) == nil then return true end
+    local reported, reportError = network.reportFarmSpatial(
+        progress.farm.id, chunks, progress.farmRevision or 0,
+        result.origin, result.radius, result.version
+    )
+    return reported, reportError
+end
+
+local function surveyGoals(point, progress)
+    local goals = {}
+    local tolerance = math.max(0, math.floor(config.scanner.surveyPositionTolerance or 2))
+    local minimumY = progress and progress.baseY + 4 or point.y - 1
+    for distance = 0, tolerance do
+        for dx = -distance, distance do
+            local dzDistance = distance - math.abs(dx)
+            for _, dz in ipairs(dzDistance == 0 and { 0 } or { -dzDistance, dzDistance }) do
+                for candidateY = point.y, minimumY, -1 do
+                    goals[#goals + 1] = {
+                        x = point.x + dx, y = candidateY,
+                        z = point.z + dz,
+                        penalty = distance * 5 + math.abs(candidateY - point.y) * 8,
+                    }
+                end
+            end
+        end
+    end
+    return goals
+end
+
+local function travelSurvey3D(progress, point, job, framework)
+    local minimumSurveyY, maximumSurveyY = progress.baseY + 1, progress.baseY + 8
+    local preferredMinimumY, preferredMaximumY = progress.baseY + 4, progress.baseY + 7
+    local tolerance = math.max(0, math.floor(config.scanner.surveyPositionTolerance or 2))
+    local function completesSurveyCenter(destination)
+        return destination and math.abs(destination.x - point.x) + math.abs(destination.z - point.z) <= tolerance
+            and destination.y >= preferredMinimumY and destination.y <= preferredMaximumY
+            and not surveySpatialMap:nearHorizontalName(destination, "leaves", 1)
+    end
+    local attempts = 0
+    while attempts < 4 do
+        attempts = attempts + 1
+        local current = nav.getPosition()
+        local exactGoals = {}
+        for _, goal in ipairs(surveyGoals(point, progress)) do
+            if not surveySpatialMap:nearHorizontalName(goal, "leaves", 1) then
+                exactGoals[#exactGoals + 1] = goal
+            end
+        end
+        state.setStatus("WORKING", ("Survey planning %d,%d from %d,%d"):format(
+            point.x, point.z, current.x, current.z
+        ))
+        local path, destination, pathError = surveySpatialMap:path(
+            current,
+            exactGoals,
+            {
+                minimumY = progress.baseY + 1,
+                maximumY = maximumSurveyY,
+            }
+        )
+        local exact = path and completesSurveyCenter(destination)
+        if not path then
+            local frontierGoals = surveySpatialMap:frontierGoals(current, point, {
+                minimumY = minimumSurveyY,
+                maximumY = maximumSurveyY,
+                preferredMinimumY = preferredMinimumY,
+                preferredMaximumY = preferredMaximumY,
+                excluded = surveyScanCenters,
+                maximumGoals = 64,
+            })
+            path, destination, pathError = surveySpatialMap:path(
+                current, frontierGoals, {
+                    minimumY = minimumSurveyY,
+                    maximumY = maximumSurveyY,
+                    excluded = surveyScanCenters,
+                }
+            )
+            if not path then
+                local escapeGoals = surveySpatialMap:frontierGoals(current, point, {
+                    minimumY = minimumSurveyY,
+                    maximumY = maximumSurveyY,
+                    preferredMinimumY = preferredMinimumY,
+                    preferredMaximumY = preferredMaximumY,
+                    excluded = surveyVisited,
+                    allowNotCloser = true,
+                    maximumGoals = 64,
+                })
+                path, destination, pathError = surveySpatialMap:path(
+                    current, escapeGoals, {
+                        minimumY = minimumSurveyY,
+                        maximumY = maximumSurveyY,
+                    }
+                )
+            end
+            if not path then return false, pathError end
+            exact = completesSurveyCenter(destination)
+        end
+        util.log("INFO", "Survey route selected", {
+            from = current, destination = destination, steps = #path, exact = exact,
+        })
+        for _, nextPoint in ipairs(path) do
+            if not shouldContinue(job, framework) then return false, "JOB_CANCELLED" end
+            local moved, moveError, block = nav.gotoXYZ(
+                nextPoint.x, nextPoint.y, nextPoint.z,
+                {
+                    shouldContinue = function() return shouldContinue(job, framework) end,
+                    routeOrder = { "x", "z", "y" },
+                    allowOverflight = false,
+                }
+            )
+            if not moved then
+                if moveError == "BLOCK" then
+                    surveySpatialMap:markOccupied(nextPoint, block and block.name)
+                    break
+                end
+                return false, moveError
+            end
+        end
+        local position = nav.getPosition()
+        surveyVisited[("%d:%d:%d"):format(position.x, position.y, position.z)] = true
+        if destination and position.x == destination.x and position.y == destination.y
+            and position.z == destination.z then return true, nil, exact end
+    end
+    return false, "SPATIAL_ROUTE_CHANGED_REPEATEDLY"
 end
 
 local function survey(progress, job, framework)
     progress.phase = "SURVEY"
     progress.surfaceColumns = progress.surfaceColumns or {}
     progress.surfaceNames = progress.surfaceNames or {}
-    if network.reportBacklogFull() then
-        local restored, restoreError = inventory.ensureModem()
-        if not restored then
-            return false, "SURVEY_BACKLOG_MODEM_FAILED: " .. tostring(restoreError)
-        end
-        local flushed, flushError = network.flushReports(true)
-        if not flushed then
-            return false, "SURVEY_REPORT_BACKLOG_FULL: " .. tostring(flushError)
-        end
+    progress.surveyIndex, progress.surveyRouteKey = nil, nil
+    progress.surveyWaypointAttempts, progress.surveyNavigationReady = nil, nil
+    local routeKey = surveyRouteKey(progress) .. ":v" .. tostring(config.scanner.surveyVersion)
+    if surveySpatialKey ~= routeKey then
+        surveySpatialKey = routeKey
+        surveySpatialMap = spatial.new(config.scanner.navigationChunks)
+        surveyScanCenters, surveyRuntimePlan, surveyRuntimeIndex, surveyDeferred, surveyVisited = {}, nil, 1, {}, {}
     end
-    if not progress.surveyNavigationReady then
-        if next(progress.surfaceColumns) then refreshSurveyNavigation(progress) end
-        local initial, initialError = scanner.scan(config.scanner.maxRadius)
-        if not initial then return false, "INITIAL_FARM_SCAN_FAILED: " .. tostring(initialError) end
-        local initialDelta = mergeScan(progress, initial)
+
+    if #surveySpatialMap.scans == 0 then
+        state.setStatus("WORKING", "Survey scanning current position")
+        local initial, scanError = scanner.scan(config.scanner.maxRadius)
+        if not initial then return false, "INITIAL_FARM_SCAN_FAILED: " .. tostring(scanError) end
+        local observed, observeError = observeSurveyScan(progress, initial)
+        if not observed then return false, "INITIAL_3D_MAP_FAILED: " .. tostring(observeError) end
+        reportSpatialScan(progress, initial)
+        local delta = mergeScan(progress, initial)
         refreshSurveyNavigation(progress)
-        local streamed, streamError = streamSurveyDelta(progress, job, initialDelta)
-        if not streamed then return false, streamError end
-        progress.surveyNavigationReady = true
-        if not checkpoint(job, framework, "Farm survey initialized safely") then
-            return false, "JOB_CANCELLED"
-        end
+        streamSurveyDelta(progress, job, delta)
     end
-    local points = surveyPoints(progress)
-    local routeKey = surveyRouteKey(progress)
-    if progress.surveyRouteKey ~= routeKey then
-        progress.surveyRouteKey = routeKey
-        progress.surveyIndex = 1
-        progress.surveyWaypointAttempts = nil
+
+    if not surveyRuntimePlan then
+        state.setStatus("WORKING", "Survey requesting missing poses")
+        local step = math.max(1, math.min(config.scanner.maxRadius, config.scanner.surveyStep))
+        local plan, planError = network.requestFarmSurveyPlan(
+            progress.farm.id,
+            { x = progress.anchor.x, z = progress.anchor.z },
+            progress.baseY, progress.radius, step, nav.getPosition(),
+            config.scanner.surveyVersion
+        )
+        surveyRuntimePlan = plan or surveyPoints(progress)
+        surveyRuntimeIndex, surveyDeferred = 1, {}
+        if not plan then addAlert(progress, "Controller survey plan unavailable: " .. tostring(planError)) end
     end
-    if type(progress.surveyIndex) ~= "number" or progress.surveyIndex ~= math.floor(progress.surveyIndex)
-        or progress.surveyIndex < 1 or progress.surveyIndex > #points + 1 then progress.surveyIndex = 1 end
-    progress.surveyIndex = progress.surveyIndex or 1
-    while progress.surveyIndex <= #points do
+
+    while surveyRuntimeIndex <= #surveyRuntimePlan do
         if not shouldContinue(job, framework) then return false, "JOB_CANCELLED" end
-        local point = points[progress.surveyIndex]
-        local arrived, travelError = travelCruise(progress, point.x, point.y, point.z, job, framework)
-        local waypointError
-        if arrived then
-            local result, scanError = scanner.scan(config.scanner.maxRadius)
-            if result then
-                local delta = mergeScan(progress, result)
-                refreshSurveyNavigation(progress)
-                progress.surveyCount = (progress.surveyCount or 0) + 1
-                local streamed, streamError = streamSurveyDelta(progress, job, delta)
-                if not streamed then return false, streamError end
-                progress.surveyWaypointAttempts = nil
+        local point = surveyRuntimePlan[surveyRuntimeIndex]
+        state.setStatus("WORKING", ("Survey pose %d/%d at %d,%d"):format(
+            surveyRuntimeIndex, #surveyRuntimePlan, point.x, point.z
+        ))
+        local arrived, travelError, exact = travelSurvey3D(progress, point, job, framework)
+        if not arrived then
+            local pointKey = ("%d:%d:%d"):format(point.x, point.y, point.z)
+            surveyDeferred[pointKey] = (surveyDeferred[pointKey] or 0) + 1
+            if surveyDeferred[pointKey] == 1 then
+                surveyRuntimePlan[#surveyRuntimePlan + 1] = point
             else
-                waypointError = "SURVEY_FAILED: " .. tostring(scanError)
+                addAlert(progress, ("SURVEY_POSE_UNREACHABLE %d,%d: %s"):format(
+                    point.x, point.z, tostring(travelError)
+                ))
             end
+            util.log("WARN", "Survey pose deferred", { point = point, reason = travelError })
+            surveyRuntimeIndex = surveyRuntimeIndex + 1
         else
-            waypointError = ("SURVEY_WAYPOINT_BLOCKED %d,%d: %s"):format(
-                point.x, point.z, tostring(travelError)
-            )
-        end
-        if waypointError then
-            progress.surveyWaypointAttempts = (progress.surveyWaypointAttempts or 0) + 1
-            if progress.surveyWaypointAttempts < 3 then
-                if not checkpoint(job, framework, ("Retrying farm survey point %d/%d"):format(
-                    progress.surveyIndex, #points
-                )) then return false, "JOB_CANCELLED" end
-                return false, waypointError
+            local position = nav.getPosition()
+            local centerKey = ("%d:%d:%d"):format(position.x, position.y, position.z)
+            local result = surveyScanCenters[centerKey] and cachedSpatialScan(position, progress) or nil
+            if not result then
+                state.setStatus("WORKING", ("Survey scanning %d,%d,%d"):format(
+                    position.x, position.y, position.z
+                ))
+                local scanError
+                result, scanError = scanner.scan(config.scanner.maxRadius)
+                if not result then return false, "SURVEY_FAILED: " .. tostring(scanError) end
+                local observed, observeError = observeSurveyScan(progress, result)
+                if not observed then return false, "SURVEY_3D_MAP_FAILED: " .. tostring(observeError) end
+                reportSpatialScan(progress, result)
             end
-            addAlert(progress, waypointError .. " (skipped after 3 attempts)")
-            progress.surveyWaypointAttempts = nil
+            local delta = mergeScan(progress, result)
+            refreshSurveyNavigation(progress)
+            streamSurveyDelta(progress, job, delta)
+            if exact then
+                progress.surveyCount = (progress.surveyCount or 0) + 1
+                surveyRuntimeIndex = surveyRuntimeIndex + 1
+            end
+            if not checkpoint(job, framework, exact and "Farm survey pose completed"
+                or "Survey frontier expanded") then return false, "JOB_CANCELLED" end
         end
-        progress.surveyIndex = progress.surveyIndex + 1
         local fueled, fuelError = refuelIfNeeded(progress, job, framework)
         if not fueled then return false, fuelError end
-        if not checkpoint(job, framework, ("Farm survey %d/%d"):format(
-            progress.surveyIndex - 1, #points
-        )) then return false, "JOB_CANCELLED" end
     end
-    progress.surveyIndex = nil
     progress.surveyComplete = true
     return true
 end

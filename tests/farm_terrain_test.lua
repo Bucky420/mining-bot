@@ -140,6 +140,14 @@ for index, point in ipairs(sweep) do
     end
 end
 check(longestRun >= 5, "survey sweep contains long straight runs")
+local reducedOverlapSweep = terrain.surveySweepPoints({ x = 0, z = 0 }, 32, 8, 5)
+check(#reducedOverlapSweep < #sweep,
+    "radius-eight survey spacing reduces redundant scan centers")
+for index = 2, #reducedOverlapSweep do
+    local previous, point = reducedOverlapSweep[index - 1], reducedOverlapSweep[index]
+    check(math.abs(point.x - previous.x) + math.abs(point.z - previous.z) <= 8,
+        "reduced-overlap survey remains reachable from the previous scan")
+end
 check(#terrain.surveySweepPoints({ x = 0.5, z = 0 }, 32, 6, 5) == 0,
     "survey sweep rejects fractional Minecraft coordinates")
 local shortScannerSweep = terrain.surveySweepPoints({ x = 0, z = 0 }, 3, 1, 5)

@@ -183,6 +183,20 @@ local events = {
         snapshotId = "snapshot", mapRevision = 1, chunkCount = 1,
     }, "bucky/mining/v1" },
     { "rednet_message", 9, {
+        type = "FARM_3D_SLICE_BEGIN", controllerBootId = "boot", requestId = "slice-99-1000",
+        farmId = "farm", x = 0, y = 69, z = 0, radius = 13,
+        environment = "cave", chunkCount = 1, cellCount = 1,
+    }, "bucky/mining/v1" },
+    { "rednet_message", 9, {
+        type = "FARM_3D_SLICE_CHUNK", controllerBootId = "boot", requestId = "slice-99-1000",
+        chunkIndex = 1, chunkCount = 1,
+        cells = { { x = 0, y = 69, z = 0, name = "minecraft:stone", class = "tunnel" } },
+    }, "bucky/mining/v1" },
+    { "rednet_message", 9, {
+        type = "FARM_3D_SLICE_END", controllerBootId = "boot", requestId = "slice-99-1000",
+        chunkCount = 1, cellCount = 1,
+    }, "bucky/mining/v1" },
+    { "rednet_message", 9, {
         type = "FARM_MAP_DELTA", controllerBootId = "boot", farmKey = "farm",
         mapRevision = 3, baseRevision = 1, chunkIndex = 1, chunkCount = 1,
         cells = { { x = 1, y = 69, z = 0, name = "minecraft:water", class = "water" } },
@@ -229,17 +243,19 @@ for _, packet in ipairs(sent) do
 end
 assert(requestedMap, "relay did not request the indexed farm map")
 
-local renderedPlayer, renderedWater, renderedTurtle = false, false, false
+local renderedPlayer, renderedWater, renderedTurtle, renderedTunnel = false, false, false, false
 local renderedEastUp = false
 for _, entry in ipairs(writes) do
     if entry.text == " " and entry.background == colors.cyan then renderedPlayer = true end
     if entry.text == " " and entry.background == colors.blue then renderedWater = true end
     if entry.text == " " and entry.background == colors.orange then renderedTurtle = true end
+    if entry.text == " " and (entry.background == colors.brown
+        or entry.background == colors.lightGray) then renderedTunnel = true end
     if entry.text:find("UP:E", 1, true) then renderedEastUp = true end
 end
 assert(renderedPlayer, "map tab did not render the followed GPS player pixel")
-assert(renderedWater, "map tab did not render a live terrain pixel")
 assert(renderedTurtle, "map tab did not render a live turtle pixel")
+assert(renderedTunnel, "map tab did not render the requested 3D tunnel layer")
 assert(renderedEastUp, "map tab did not use controller Player Detector yaw")
 
 writes, sent, eventIndex, timerId, current = {}, {}, 0, 0, native
@@ -270,6 +286,20 @@ events = {
         snapshotId = "map-snapshot", mapRevision = 1,
     }, "bucky/mining/v1" },
     { "rednet_message", 9, {
+        type = "FARM_3D_SLICE_BEGIN", controllerBootId = "boot-map", requestId = "slice-99-1000",
+        farmId = "farm", x = 88582, y = 69, z = 73676,
+        radius = 64, environment = "surface", chunkCount = 1, cellCount = 1,
+    }, "bucky/mining/v1" },
+    { "rednet_message", 9, {
+        type = "FARM_3D_SLICE_CHUNK", controllerBootId = "boot-map", requestId = "slice-99-1000",
+        chunkIndex = 1, chunkCount = 1,
+        cells = { { x = 88583, y = 69, z = 73676, name = "minecraft:stone", class = "tunnel" } },
+    }, "bucky/mining/v1" },
+    { "rednet_message", 9, {
+        type = "FARM_3D_SLICE_END", controllerBootId = "boot-map", requestId = "slice-99-1000",
+        chunkCount = 1, cellCount = 1,
+    }, "bucky/mining/v1" },
+    { "rednet_message", 9, {
         type = "TURTLE_UPDATE", controllerBootId = "boot-map",
         turtle = { id = 12, name = "worker", heading = "east", lastSeen = 1000,
             position = { x = 88584, y = 70, z = 73676 } },
@@ -288,18 +318,22 @@ events = {
 
 ok, loadError = pcall(assert(loadfile("drag-to-relay-pc/relay-map.lua")))
 assert(not ok and tostring(loadError):find("STOP_RELAY_TEST", 1, true), tostring(loadError))
-renderedWater, renderedTurtle, renderedEastUp = false, false, false
+renderedWater, renderedTurtle, renderedEastUp, renderedTunnel = false, false, false, false
 local waterBlit = colors.toBlit(colors.blue)
 local turtleBlit = colors.toBlit(colors.orange)
+local tunnelBlit = colors.toBlit(colors.brown)
 for _, entry in ipairs(writes) do
     if entry.blit and (entry.foreground:find(waterBlit, 1, true)
         or entry.background:find(waterBlit, 1, true)) then renderedWater = true end
     if entry.blit and (entry.foreground:find(turtleBlit, 1, true)
         or entry.background:find(turtleBlit, 1, true)) then renderedTurtle = true end
+    if entry.blit and (entry.foreground:find(tunnelBlit, 1, true)
+        or entry.background:find(tunnelBlit, 1, true)) then renderedTunnel = true end
     if entry.text:find("UP:E", 1, true) then renderedEastUp = true end
 end
-assert(renderedWater, "native map did not center and render terrain without GPS")
+assert(renderedWater, "native map did not retain the surface map while outdoors")
 assert(renderedTurtle, "native map did not center and render the turtle without GPS")
+assert(not renderedTunnel, "native map showed cave data while classified as surface")
 assert(renderedEastUp, "native map did not use Player Detector yaw")
 
 local titles, focused, openedProgram, openedArgument = {}, nil, nil, nil

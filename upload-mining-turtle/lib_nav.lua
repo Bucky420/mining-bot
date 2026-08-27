@@ -424,7 +424,7 @@ local function travelAxis(axis, target, options)
     return true
 end
 
-function nav.gotoXYZ(x, y, z, options)
+local function gotoXYZDirect(x, y, z, options)
     if type(x) ~= "number" or type(y) ~= "number" or type(z) ~= "number" then
         return false, "INVALID_DESTINATION"
     end
@@ -434,6 +434,22 @@ function nav.gotoXYZ(x, y, z, options)
         if not ok then return false, reason, block end
     end
     return true
+end
+
+function nav.gotoXYZ(x, y, z, options)
+    options = options or {}
+    local moved, moveError, block = gotoXYZDirect(x, y, z, options)
+    if moved or moveError ~= "BLOCK" or options.allowOverflight ~= true
+        or x == nav.getPosition().x and z == nav.getPosition().z then
+        return moved, moveError, block
+    end
+    local current = nav.getPosition()
+    local maximumY = tonumber(options.maximumY)
+        or current.y + math.max(1, math.floor(tonumber(config.movement.maxOverflightRise) or 16))
+    return nav.overflyXYZ(x, y, z, {
+        maximumY = maximumY,
+        shouldContinue = options.shouldContinue,
+    })
 end
 
 function nav.overflyXYZ(x, y, z, options)
@@ -452,11 +468,11 @@ function nav.overflyXYZ(x, y, z, options)
     }
     while true do
         local current = nav.getPosition()
-        local crossed, crossError, block = nav.gotoXYZ(
+        local crossed, crossError, block = gotoXYZDirect(
             x, current.y, z, horizontalOptions
         )
         if crossed then
-            local descended, descendError, descendBlock = nav.gotoXYZ(
+            local descended, descendError, descendBlock = gotoXYZDirect(
                 x, y, z, verticalOptions
             )
             if descended then return true end
@@ -478,6 +494,52 @@ function nav.overflyXYZ(x, y, z, options)
             return false, raiseError, raiseBlock
         end
     end
+end
+
+function nav.followWaypoints(path, options)
+    options = options or {}
+    if type(path) ~= "table" then return false, "INVALID_3D_ROUTE" end
+    local previous = nav.getPosition()
+    for _, point in ipairs(path) do
+        if type(point) ~= "table" or type(point.x) ~= "number"
+            or type(point.y) ~= "number" or type(point.z) ~= "number"
+            or point.x ~= math.floor(point.x) or point.y ~= math.floor(point.y)
+            or point.z ~= math.floor(point.z)
+            or math.abs(point.x - previous.x) + math.abs(point.y - previous.y)
+                + math.abs(point.z - previous.z) ~= 1 then
+            return false, "INVALID_3D_ROUTE_STEP"
+        end
+        if options.shouldContinue and not options.shouldContinue() then return false, "JOB_CANCELLED" end
+        local moved, moveError, block = nav.gotoXYZ(point.x, point.y, point.z, {
+            shouldContinue = options.shouldContinue,
+            routeOrder = { "x", "z", "y" },
+            allowOverflight = false,
+            dig = options.dig,
+        })
+        if not moved then return false, moveError, block, point end
+        previous = point
+    end
+    return true
+end
+
+function nav.routeXYZ(mapId, x, y, z, options)
+    options = options or {}
+    local network = require("lib.network")
+    local target = { x = x, y = y, z = z }
+    local lastError, lastBlock, lastPoint
+    for attempt = 1, 2 do
+        local path, routeError, reservationId = network.requestRoute(
+            mapId or "world", nav.getPosition(), target
+        )
+        if not path then return false, routeError end
+        local moved, moveError, block, point = nav.followWaypoints(path, options)
+        network.finishRoute(reservationId, not moved, point, block)
+        if moved then return true end
+        if moveError ~= "BLOCK" or attempt == 2 then return false, moveError, block, point end
+        lastError, lastBlock, lastPoint = moveError, block, point
+        sleep(0.2)
+    end
+    return false, lastError, lastBlock, lastPoint
 end
 
 function nav.directionVector(direction)

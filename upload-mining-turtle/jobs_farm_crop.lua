@@ -723,7 +723,8 @@ function farmCrop.run(job, framework)
         if not outputReady then
             local home = state.get().home
             if home then
-                local _, recoveryError = nav.gotoXYZ(home.position.x, home.position.y, home.position.z, {
+                local _, recoveryError = nav.routeXYZ(
+                    "world", home.position.x, home.position.y, home.position.z, {
                     shouldContinue = function() return not framework.isCancellationRequested(job) end,
                 })
                 if recoveryError == "JOB_CANCELLED" then return false, recoveryError end
@@ -731,8 +732,8 @@ function farmCrop.run(job, framework)
             return false, outputError
         end
     end
-    local atFarm, farmError, blockingFarmBlock = nav.gotoXYZ(
-        farm.x, farm.y, farm.z,
+    local atFarm, farmError, blockingFarmBlock = nav.routeXYZ(
+        farm.id or "world", farm.x, farm.y, farm.z,
         cropTravelOptions(farm.y, function() return not framework.isCancellationRequested(job) end)
     )
     if not atFarm and farmError == "BLOCK" and blockingFarmBlock
@@ -747,8 +748,8 @@ function farmCrop.run(job, framework)
         if not framework.checkpoint(job, "Raised farm path above a tall crop") then
             return false, "JOB_CANCELLED"
         end
-        atFarm, farmError, blockingFarmBlock = nav.gotoXYZ(
-            farm.x, farm.y, farm.z,
+        atFarm, farmError, blockingFarmBlock = nav.routeXYZ(
+            farm.id or "world", farm.x, farm.y, farm.z,
             cropTravelOptions(farm.y, function() return not framework.isCancellationRequested(job) end)
         )
     end
@@ -961,7 +962,8 @@ function farmCrop.run(job, framework)
     if not unloaded then return false, unloadError end
     local home = state.get().home
     local returnPosition = home and home.position or farm
-    local returned, returnError = nav.gotoXYZ(returnPosition.x, returnPosition.y, returnPosition.z, {
+    local returned, returnError = nav.routeXYZ(
+        "world", returnPosition.x, returnPosition.y, returnPosition.z, {
         shouldContinue = function() return not framework.isCancellationRequested(job) end,
     })
     if returnError == "JOB_CANCELLED" then return false, returnError end

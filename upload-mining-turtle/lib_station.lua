@@ -30,7 +30,14 @@ end
 function station.arrive(value, role, options)
     local found, stationError = station.validate(value)
     if not found then return nil, stationError end
-    local arrived, travelError = nav.gotoXYZ(found.x, found.y, found.z, options)
+    local arrived, travelError
+    if options and options.localNavigation then
+        arrived, travelError = nav.gotoXYZ(found.x, found.y, found.z, options)
+    else
+        arrived, travelError = nav.routeXYZ(
+            options and options.mapId or "world", found.x, found.y, found.z, options
+        )
+    end
     if travelError == "JOB_CANCELLED" then return nil, travelError end
     if not arrived then return nil, "STATION_TRAVEL_FAILED: " .. tostring(travelError) end
     local direction = role == "supply" and found.supplyDirection or found.outputDirection
@@ -70,9 +77,17 @@ end
 function station.verifyOutputAt(output, protectedItems, options, minimumSlots)
     if type(output) ~= "table" or type(output.approach) ~= "table"
         or not directions[output.direction] then return nil, "INVALID_OUTPUT_CHEST_LOCATION" end
-    local arrived, travelError = nav.gotoXYZ(
-        output.approach.x, output.approach.y, output.approach.z, options
-    )
+    local arrived, travelError
+    if options and options.localNavigation then
+        arrived, travelError = nav.gotoXYZ(
+            output.approach.x, output.approach.y, output.approach.z, options
+        )
+    else
+        arrived, travelError = nav.routeXYZ(
+            options and options.mapId or "world",
+            output.approach.x, output.approach.y, output.approach.z, options
+        )
+    end
     if travelError == "JOB_CANCELLED" then return nil, travelError end
     if not arrived then return nil, "OUTPUT_TRAVEL_FAILED: " .. tostring(travelError) end
     local faced, faceError = nav.face(output.direction)

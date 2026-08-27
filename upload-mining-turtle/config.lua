@@ -22,6 +22,7 @@ local config = {
         retryDelay = 1,
         digRetries = 12,
         routeOrder = { "x", "z", "y" },
+        maxOverflightRise = 16,
     },
 
     jobs = {
@@ -61,7 +62,15 @@ local config = {
     },
 
     scanner = {
+        surveyVersion = 2,
         maxRadius = 8,
+        retryAttempts = 4,
+        retryDelay = 2,
+        navigationChunks = 3,
+        surveyStep = 8,
+        surveyPositionTolerance = 2,
+        spatialFreshnessMs = 900000,
+        stableSpatialFreshnessMs = 86400000,
         chestNameContains = "chest",
         cropNameContains = "flax",
     },
@@ -122,7 +131,7 @@ local config = {
 
     logging = {
         level = "INFO",
-        maxFileBytes = 65536,
+        maxFileBytes = 8192,
     },
 }
 

@@ -113,6 +113,20 @@ assert(loaded, readError)
 assert(loaded.revision == 4 and loaded.data.cells["1:2"].occupant == "minecraft:wheat",
     "terrain region should survive compact storage round trip")
 
+local spatialValue = { version = 1, farmId = "farm:test", chunkKey = "0:4:0", cells = {} }
+local spatialReference, spatialError = storage.writeValue(
+    "bucky/terrain-3d/farm/chunk.map", spatialValue, nil,
+    function(value) return value.version == 1 and type(value.cells) == "table" end
+)
+assert(spatialReference, spatialError)
+local loadedSpatial = assert(storage.readValue(spatialReference, function(value)
+    return value.farmId == "farm:test"
+end))
+assert(loadedSpatial.chunkKey == "0:4:0", "generic 3D storage did not round trip")
+local stats = storage.stats(8)
+assert(stats.connected == 2 and stats.maximum == 8 and stats.capacity == 2000000,
+    "storage statistics did not aggregate mounted computer volumes")
+
 local selectedDrive
 for _, volume in ipairs(storage.describe()) do
     if volume.id == reference.volumeId then selectedDrive = volume.drive break end

@@ -1,5 +1,43 @@
 local route = {}
 
+local directions3D = {
+    { 1, 0, 0, 10 }, { -1, 0, 0, 10 }, { 0, 0, 1, 10 }, { 0, 0, -1, 10 },
+    { 0, 1, 0, 12 }, { 0, -1, 0, 12 },
+}
+
+local function pointKey(x, y, z) return ("%d:%d:%d"):format(x, y, z) end
+local function air(cell)
+    return cell and (cell.name == "minecraft:air" or cell.name == "minecraft:cave_air"
+        or cell.name == "minecraft:void_air")
+end
+
+local function heapPush(heap, entry)
+    heap[#heap + 1] = entry
+    local index = #heap
+    while index > 1 do
+        local parent = math.floor(index / 2)
+        if heap[parent].priority <= entry.priority then break end
+        heap[index] = heap[parent]
+        index = parent
+    end
+    heap[index] = entry
+end
+
+local function heapPop(heap)
+    local result, tail = heap[1], table.remove(heap)
+    if #heap == 0 then return result end
+    local index = 1
+    while index * 2 <= #heap do
+        local child = index * 2
+        if child < #heap and heap[child + 1].priority < heap[child].priority then child = child + 1 end
+        if heap[child].priority >= tail.priority then break end
+        heap[index] = heap[child]
+        index = child
+    end
+    heap[index] = tail
+    return result
+end
+
 local vectors = {
     north = { x = 0, z = -1, index = 0 },
     east = { x = 1, z = 0, index = 1 },
@@ -71,6 +109,75 @@ function route.find(cells, start, target, startHeading)
         end
     end
     return nil
+end
+
+function route.find3D(start, target, readCell, excluded, options)
+    options = options or {}
+    if type(start) ~= "table" or type(target) ~= "table" or type(readCell) ~= "function" then
+        return nil, "INVALID_3D_ROUTE"
+    end
+    for _, point in ipairs({ start, target }) do
+        if type(point.x) ~= "number" or type(point.y) ~= "number" or type(point.z) ~= "number"
+            or point.x ~= math.floor(point.x) or point.y ~= math.floor(point.y)
+            or point.z ~= math.floor(point.z) then return nil, "INVALID_3D_ROUTE" end
+    end
+    local startKey, targetKey = pointKey(start.x, start.y, start.z), pointKey(target.x, target.y, target.z)
+    if startKey == targetKey then return {} end
+    excluded = excluded or {}
+    if excluded[targetKey] or not air(readCell(target.x, target.y, target.z)) then
+        return nil, "DESTINATION_NOT_KNOWN_AIR"
+    end
+    local margin = math.max(4, math.floor(tonumber(options.margin) or 24))
+    local minimumX, maximumX = math.min(start.x, target.x) - margin, math.max(start.x, target.x) + margin
+    local minimumY, maximumY = math.max(-64, math.min(start.y, target.y) - margin),
+        math.min(320, math.max(start.y, target.y) + margin)
+    local minimumZ, maximumZ = math.min(start.z, target.z) - margin, math.max(start.z, target.z) + margin
+    local maximumNodes = math.max(1, math.floor(tonumber(options.maximumNodes) or 30000))
+    local function estimate(x, y, z)
+        return (math.abs(target.x - x) + math.abs(target.z - z)) * 10
+            + math.abs(target.y - y) * 12
+    end
+    local open = {}
+    heapPush(open, {
+        key = startKey, x = start.x, y = start.y, z = start.z,
+        cost = 0, priority = estimate(start.x, start.y, start.z),
+    })
+    local costs, previous, points = { [startKey] = 0 }, {}, {
+        [startKey] = { x = start.x, y = start.y, z = start.z },
+    }
+    local visited = 0
+    while #open > 0 and visited < maximumNodes do
+        local current = heapPop(open)
+        if current.cost == costs[current.key] then
+            visited = visited + 1
+            if current.key == targetKey then
+                local result, cursor = {}, targetKey
+                while cursor ~= startKey do
+                    table.insert(result, 1, points[cursor])
+                    cursor = previous[cursor]
+                end
+                return result
+            end
+            for _, direction in ipairs(directions3D) do
+                local x, y, z = current.x + direction[1], current.y + direction[2], current.z + direction[3]
+                local nextKey = pointKey(x, y, z)
+                if x >= minimumX and x <= maximumX and y >= minimumY and y <= maximumY
+                    and z >= minimumZ and z <= maximumZ and not excluded[nextKey]
+                    and air(readCell(x, y, z)) then
+                    local nextCost = current.cost + direction[4]
+                    if not costs[nextKey] or nextCost < costs[nextKey] then
+                        costs[nextKey], previous[nextKey] = nextCost, current.key
+                        points[nextKey] = { x = x, y = y, z = z }
+                        heapPush(open, {
+                            key = nextKey, x = x, y = y, z = z,
+                            cost = nextCost, priority = nextCost + estimate(x, y, z),
+                        })
+                    end
+                end
+            end
+        end
+    end
+    return nil, visited >= maximumNodes and "ROUTE_SEARCH_LIMIT" or "NO_KNOWN_3D_ROUTE"
 end
 
 return route

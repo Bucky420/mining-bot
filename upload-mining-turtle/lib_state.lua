@@ -86,6 +86,13 @@ local function decodeMap(blob, includeValue)
 end
 
 local function compactProgress(progress)
+    if progress.phase == "SURVEY" then
+        progress.surfaceColumns, progress.surfaceNames = nil, nil
+        progress.scanTiles, progress.navAllowed = nil, nil
+        progress.surveyIndex, progress.surveyRouteKey = nil, nil
+        progress.surveyWaypointAttempts, progress.surveyNavigationReady = nil, nil
+        return
+    end
     if type(progress.scanTiles) == "table" then
         while #progress.scanTiles > 4 do table.remove(progress.scanTiles, 1) end
         local retained = {}
@@ -167,6 +174,15 @@ local function compactReports(data)
     end
 end
 
+local function discardSurveyReports(data)
+    for index = #data.reportOutbox, 1, -1 do
+        local reportType = type(data.reportOutbox[index]) == "table" and data.reportOutbox[index].type
+        if reportType == "FARM_3D_MAP" or reportType == "FARM_MAP" then
+            table.remove(data.reportOutbox, index)
+        end
+    end
+end
+
 local function expandReports(data)
     for _, message in ipairs(data.reportOutbox or {}) do
         local payload = type(message) == "table" and message.payload
@@ -231,9 +247,24 @@ local function validate(data)
     data.equipment = data.equipment or { left = nil, right = nil }
     data.movesSinceGps = data.movesSinceGps or 0
     if data.navigationReady == nil then data.navigationReady = false end
+    discardSurveyReports(data)
     expandReports(data)
     eachFarmProgress(data, expandProgress)
     eachFarmProgress(data, function(progress)
+        if type(progress.alerts) == "table" then
+            local compact = {}
+            for _, alert in ipairs(progress.alerts) do
+                if compact[#compact] ~= alert then compact[#compact + 1] = alert end
+            end
+            while #compact > 20 do table.remove(compact, 1) end
+            progress.alerts = compact
+        end
+        if progress.phase == "SURVEY" then
+            progress.surfaceColumns, progress.surfaceNames = {}, {}
+            progress.scanTiles, progress.navAllowed = nil, nil
+            progress.surveyIndex, progress.surveyRouteKey = nil, nil
+            progress.surveyWaypointAttempts, progress.surveyNavigationReady = nil, nil
+        end
         if progress.columns or progress.plan and progress.planFormat ~= 1 then
             -- Early farm-service builds persisted raw Geo Scanner records.
             -- Restart that survey using the compact column format.

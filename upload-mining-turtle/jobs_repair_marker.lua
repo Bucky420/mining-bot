@@ -12,7 +12,8 @@ function repairMarker.run(job, framework)
     end
     if type(markerType) ~= "string" then return false, "REPAIR_REQUIRES_MARKER_TYPE" end
 
-    local arrived, travelError = nav.gotoXYZ(p.x, p.y, p.z, {
+    local arrived, travelError = nav.routeXYZ(
+        job.parameters.mapId or "world", p.x, p.y, p.z, {
         shouldContinue = function() return not framework.isCancellationRequested(job) end,
     })
     if travelError == "JOB_CANCELLED" then return false, travelError end

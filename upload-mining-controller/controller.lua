@@ -2,8 +2,10 @@ local NETWORK_ID = tostring(settings.get("bucky.network", "bucky"))
 local JOB_PROTOCOL = NETWORK_ID .. "/mining/v1"
 local DEPLOY_PROTOCOL = NETWORK_ID .. "/deployment/v1"
 local STATE_PATH = "/data/controller.state"
+local MAX_STORAGE_DRIVES = tonumber(settings.get("bucky.storage.maxDrives", 8)) or 8
 local BOOT_ID = ("%d:%d"):format(os.getComputerID(), os.epoch("utc"))
 local storage = require("lib.controller_storage")
+local spatialStorage = require("lib.controller_spatial")
 local routePlanner = require("lib.controller_route")
 
 local function finiteNumber(value)
@@ -59,18 +61,32 @@ local function enableMonitorOutput()
     local function redraw()
         local width, height = monitor.getSize()
         monitor.clear()
+        local stats = storage.stats(MAX_STORAGE_DRIVES)
+        local left = ("Storage %.1f%% %d/%d"):format(
+            stats.percent, stats.connected, stats.maximum
+        )
+        local right = ("%d/%d"):format(stats.used, stats.capacity)
         monitor.setCursorPos(1, 1)
+        monitor.write(left:sub(1, width))
+        if #right < width then
+            monitor.setCursorPos(width - #right + 1, 1)
+            monitor.write(right)
+        end
+        local lines = {}
         for _, value in ipairs(history) do
             local text = tostring(value)
             repeat
-                local line = text:sub(1, width)
+                lines[#lines + 1] = text:sub(1, width)
                 text = text:sub(width + 1)
-                local _, y = monitor.getCursorPos()
-                if y > height then monitor.scroll(1) y = height end
-                monitor.setCursorPos(1, y)
-                monitor.write(line)
-                monitor.setCursorPos(1, y + 1)
             until text == ""
+        end
+        local first = math.max(1, #lines - math.max(0, height - 2))
+        local row = 2
+        for index = first, #lines do
+            if row > height then break end
+            monitor.setCursorPos(1, row)
+            monitor.write(lines[index])
+            row = row + 1
         end
     end
     local function mirror(value)
@@ -127,7 +143,7 @@ local function loadState()
                     for _, field in ipairs({
                         "turtles", "jobs", "processedReports", "processedReportOrder",
                         "remoteCommands", "remoteCommandOrder", "sites", "farmMaps",
-                        "surveys", "alerts", "relays", "terrainStorage",
+                        "surveys", "alerts", "relays", "terrainStorage", "spatialStorage",
                     }) do
                         if value[field] == nil then value[field] = {}
                         elseif type(value[field]) ~= "table" then valid = false end
@@ -159,14 +175,17 @@ local function loadState()
         version = 1, turtles = {}, jobs = {}, processedReports = {}, processedReportOrder = {},
         nextTurtleNumber = 1, nextAlertSequence = 1, remoteCommands = {}, remoteCommandOrder = {},
         sites = {}, farmMaps = {}, surveys = {}, alerts = {}, relays = {}, terrainStorage = {},
+        spatialStorage = {},
     }
 end
 
 local controllerState = loadState()
+spatialStorage.configure(controllerState.spatialStorage)
 local farmMapsTrimmedAtBoot = boundFarmMaps(controllerState.farmMaps)
 local activeRelays = {}
 local announcedTurtleRelease
 local trackedPlayer
+local routeReservations = {}
 local playerDetector = peripheral.find("playerDetector") or peripheral.find("player_detector")
 for _, turtleInfo in pairs(controllerState.turtles) do turtleInfo.online = false end
 
@@ -224,31 +243,93 @@ local function handleFarmRouteRequest(sender, message)
     local start, target = message.start, message.target
     local function reject(reason)
         rednet.send(sender, {
-            type = "FARM_ROUTE_RESPONSE", requestId = requestId,
+            type = message.type == "ROUTE_REQUEST" and "ROUTE_RESPONSE" or "FARM_ROUTE_RESPONSE",
+            requestId = requestId,
             ok = false, error = reason, controllerBootId = BOOT_ID,
         }, JOB_PROTOCOL)
     end
     if not requestId or not controllerState.turtles[sender] then return reject("UNREGISTERED_WORKER") end
     if type(start) ~= "table" or type(target) ~= "table"
-        or type(start.x) ~= "number" or type(start.z) ~= "number"
-        or type(target.x) ~= "number" or type(target.z) ~= "number"
-        or start.x ~= math.floor(start.x) or start.z ~= math.floor(start.z)
-        or target.x ~= math.floor(target.x) or target.z ~= math.floor(target.z) then
+        or type(start.x) ~= "number" or type(start.y) ~= "number" or type(start.z) ~= "number"
+        or type(target.x) ~= "number" or type(target.y) ~= "number" or type(target.z) ~= "number"
+        or start.x ~= math.floor(start.x) or start.y ~= math.floor(start.y)
+        or start.z ~= math.floor(start.z) or target.x ~= math.floor(target.x)
+        or target.y ~= math.floor(target.y) or target.z ~= math.floor(target.z) then
         return reject("INVALID_ROUTE_COORDINATES")
     end
-    local farmMap, loadError = loadFarmMap(message.farmId)
-    if not farmMap then return reject(loadError) end
-    if type(message.minRevision) == "number" and farmMap.revision < message.minRevision then
-        farmMap.data.cells = nil
-        return reject("CONTROLLER_TERRAIN_STALE")
+    local turtleInfo = controllerState.turtles[sender]
+    if type(turtleInfo.position) ~= "table" or turtleInfo.position.x ~= start.x
+        or turtleInfo.position.y ~= start.y or turtleInfo.position.z ~= start.z
+        or not turtleInfo.positionVerifiedAt or not turtleInfo.lastSeen
+        or os.epoch("utc") - turtleInfo.lastSeen > 45000 then
+        return reject("ROUTE_START_NOT_VERIFIED")
     end
-    local path = routePlanner.find(farmMap.data.cells or {}, start, target, message.heading)
-    if not path then return reject("NO_SAFE_CONTROLLER_ROUTE") end
+    local mapId = message.mapId or message.farmId or "world"
+    if type(mapId) ~= "string" then return reject("INVALID_ROUTE_MAP") end
+    local now, excluded = os.epoch("utc"), {}
+    for reservationId, reservation in pairs(routeReservations) do
+        if reservation.expiresAt <= now then routeReservations[reservationId] = nil
+        elseif reservation.turtleId ~= sender then
+            for _, point in ipairs(reservation.path) do
+                excluded[("%d:%d:%d"):format(point.x, point.y, point.z)] = true
+            end
+        end
+    end
+    for turtleId, other in pairs(controllerState.turtles) do
+        if turtleId ~= sender and other.online ~= false and type(other.position) == "table"
+            and other.lastSeen and now - other.lastSeen <= 45000 then
+            for dx = -1, 1 do for dy = -1, 1 do for dz = -1, 1 do
+                excluded[("%d:%d:%d"):format(
+                    math.floor(other.position.x) + dx, math.floor(other.position.y) + dy,
+                    math.floor(other.position.z) + dz
+                )] = true
+            end end end
+        end
+    end
+    if trackedPlayer and trackedPlayer.sampledAt and now - trackedPlayer.sampledAt <= 2000 then
+        for dx = -2, 2 do for dy = -1, 2 do for dz = -2, 2 do
+            excluded[("%d:%d:%d"):format(
+                math.floor(trackedPlayer.x) + dx, math.floor(trackedPlayer.y) + dy,
+                math.floor(trackedPlayer.z) + dz
+            )] = true
+        end end end
+    end
+    local path, routeError = routePlanner.find3D(
+        start, target, spatialStorage.cellReader(mapId), excluded,
+        { maximumNodes = 30000, margin = 24 }
+    )
+    if not path then return reject(routeError or "NO_SAFE_CONTROLLER_ROUTE") end
+    if #path > 1024 then return reject("CONTROLLER_ROUTE_TOO_LONG") end
+    local reservationId = ("route-%d-%d"):format(sender, now)
+    local reservationExpiresAt = now + math.max(30000, #path * 1500 + 10000)
+    routeReservations[reservationId] = {
+        turtleId = sender, mapId = mapId, path = detachedCopy(path),
+        acquiredAt = now, expiresAt = reservationExpiresAt,
+    }
     rednet.send(sender, {
-        type = "FARM_ROUTE_RESPONSE", requestId = requestId, ok = true,
-        path = path, mapRevision = farmMap.revision, controllerBootId = BOOT_ID,
+        type = message.type == "ROUTE_REQUEST" and "ROUTE_RESPONSE" or "FARM_ROUTE_RESPONSE",
+        requestId = requestId, ok = true, path = path,
+        reservationId = reservationId, reservationExpiresAt = reservationExpiresAt,
+        controllerBootId = BOOT_ID,
     }, JOB_PROTOCOL)
-    farmMap.data.cells = nil
+end
+
+local function handleRouteControl(sender, message)
+    local reservation = type(message.reservationId) == "string"
+        and routeReservations[message.reservationId]
+    if not reservation or reservation.turtleId ~= sender then return end
+    if message.type == "ROUTE_BLOCKED" and type(message.point) == "table"
+        and type(message.blockName) == "string" then
+        local updated, updateError = spatialStorage.updateCell(
+            reservation.mapId, message.point, message.blockName
+        )
+        if not updated then
+            printError("Blocked route map update failed: " .. tostring(updateError))
+        elseif not saveState() then
+            printError("Blocked route map index could not be saved")
+        end
+    end
+    routeReservations[message.reservationId] = nil
 end
 
 local function handleFarmTerrainRequest(sender, message)
@@ -299,6 +380,125 @@ local function handleFarmTerrainRequest(sender, message)
     farmMap.data.cells = nil
 end
 
+local function handleFarmSpatialRequest(sender, message)
+    local requestId = type(message.requestId) == "string" and message.requestId
+    if not requestId or not controllerState.turtles[sender] or type(message.farmId) ~= "string"
+        or type(message.chunks) ~= "table" or #message.chunks < 1 or #message.chunks > 27 then
+        rednet.send(sender, {
+            type = "FARM_3D_CHUNK_RESPONSE", requestId = requestId, ok = false,
+            error = "INVALID_SPATIAL_REQUEST", controllerBootId = BOOT_ID,
+        }, JOB_PROTOCOL)
+        return
+    end
+    for _, chunkKey in ipairs(message.chunks) do
+        if type(chunkKey) ~= "string" or not chunkKey:match("^-?%d+:-?%d+:-?%d+$") then
+            rednet.send(sender, {
+                type = "FARM_3D_CHUNK_RESPONSE", requestId = requestId, ok = false,
+                error = "INVALID_SPATIAL_CHUNK_KEY", controllerBootId = BOOT_ID,
+            }, JOB_PROTOCOL)
+            return
+        end
+        local chunk = spatialStorage.read(message.farmId, chunkKey)
+        rednet.send(sender, {
+            type = "FARM_3D_CHUNK_RESPONSE", requestId = requestId, ok = true,
+            farmId = message.farmId, chunkKey = chunkKey, chunk = chunk,
+            missing = chunk == nil,
+            controllerBootId = BOOT_ID,
+        }, JOB_PROTOCOL)
+    end
+end
+
+local function handleFarmSurveyPlanRequest(sender, message)
+    local requestId = type(message.requestId) == "string" and message.requestId
+    local center, start = message.center, message.start
+    local radius, step, baseY = tonumber(message.radius), tonumber(message.step), tonumber(message.baseY)
+    local valid = requestId and controllerState.turtles[sender] and type(message.farmId) == "string"
+        and type(center) == "table" and type(start) == "table"
+        and type(center.x) == "number" and center.x == math.floor(center.x)
+        and type(center.z) == "number" and center.z == math.floor(center.z)
+        and type(start.x) == "number" and start.x == math.floor(start.x)
+        and type(start.z) == "number" and start.z == math.floor(start.z)
+        and baseY and baseY == math.floor(baseY) and radius and radius >= 1 and radius <= 128
+        and radius == math.floor(radius) and step and step >= 1 and step <= 16
+        and step == math.floor(step) and message.version == 2
+    if not valid then
+        rednet.send(sender, {
+            type = "FARM_3D_SURVEY_PLAN_RESPONSE", requestId = requestId, ok = false,
+            error = "INVALID_SURVEY_PLAN_REQUEST", controllerBootId = BOOT_ID,
+        }, JOB_PROTOCOL)
+        return
+    end
+    local poses, version = spatialStorage.surveyPlan(
+        message.farmId, center.x, center.z, baseY, radius, step, start
+    )
+    if #poses > 1024 then
+        rednet.send(sender, {
+            type = "FARM_3D_SURVEY_PLAN_RESPONSE", requestId = requestId, ok = false,
+            error = "SURVEY_PLAN_TOO_LARGE", controllerBootId = BOOT_ID,
+        }, JOB_PROTOCOL)
+        return
+    end
+    rednet.send(sender, {
+        type = "FARM_3D_SURVEY_PLAN_RESPONSE", requestId = requestId, ok = true,
+        farmId = message.farmId, version = version, poses = poses,
+        controllerBootId = BOOT_ID,
+    }, JOB_PROTOCOL)
+end
+
+local function surfaceEnvironment(farmId, x, y, z)
+    local farmMap = loadFarmMap(farmId)
+    for _, cell in pairs(farmMap and farmMap.data and farmMap.data.cells or {}) do
+        if math.floor(cell.x) == math.floor(x) and math.floor(cell.z) == math.floor(z) then
+            local surfaceY = tonumber(cell.surfaceY) or tonumber(cell.y)
+            if surfaceY then return y >= surfaceY + 1 and "surface" or "cave" end
+        end
+    end
+    return nil
+end
+
+local function handleRelaySpatialSliceRequest(sender, message)
+    local requestId = type(message.requestId) == "string" and message.requestId
+    local farmId, centerX, centerZ = message.farmId, tonumber(message.x), tonumber(message.z)
+    local layerY, radius = tonumber(message.y), tonumber(message.radius)
+    if not requestId or not activeRelays[sender] or type(farmId) ~= "string"
+        or not finiteNumber(centerX) or not finiteNumber(centerZ) or not finiteNumber(layerY)
+        or not finiteNumber(radius) or radius < 4 or radius > 64 then
+        rednet.send(sender, {
+            type = "FARM_3D_SLICE_RESPONSE", requestId = requestId, ok = false,
+            error = "INVALID_3D_SLICE_REQUEST", controllerBootId = BOOT_ID,
+        }, JOB_PROTOCOL)
+        return
+    end
+    centerX, centerZ, layerY, radius = math.floor(centerX), math.floor(centerZ),
+        math.floor(layerY), math.floor(radius)
+    local cells = spatialStorage.slice(farmId, centerX, centerZ, layerY, radius)
+    local focusX = trackedPlayer and trackedPlayer.x or centerX
+    local focusY = trackedPlayer and trackedPlayer.y or layerY
+    local focusZ = trackedPlayer and trackedPlayer.z or centerZ
+    local environment = surfaceEnvironment(farmId, focusX, focusY, focusZ)
+        or spatialStorage.classify(farmId, focusX, focusY, focusZ)
+    local chunkCount = math.max(1, math.ceil(#cells / 64))
+    rednet.send(sender, {
+        type = "FARM_3D_SLICE_BEGIN", requestId = requestId, farmId = farmId,
+        x = centerX, y = layerY, z = centerZ, radius = radius,
+        environment = environment,
+        cellCount = #cells, chunkCount = chunkCount, controllerBootId = BOOT_ID,
+    }, JOB_PROTOCOL)
+    for chunkIndex = 1, chunkCount do
+        local chunk, first = {}, (chunkIndex - 1) * 64 + 1
+        for index = first, math.min(first + 63, #cells) do chunk[#chunk + 1] = cells[index] end
+        rednet.send(sender, {
+            type = "FARM_3D_SLICE_CHUNK", requestId = requestId,
+            chunkIndex = chunkIndex, chunkCount = chunkCount, cells = chunk,
+            controllerBootId = BOOT_ID,
+        }, JOB_PROTOCOL)
+    end
+    rednet.send(sender, {
+        type = "FARM_3D_SLICE_END", requestId = requestId,
+        chunkCount = chunkCount, cellCount = #cells, controllerBootId = BOOT_ID,
+    }, JOB_PROTOCOL)
+end
+
 local storageChanged = false
 for farmKey, farmMap in pairs(controllerState.farmMaps) do
     if type(farmMap.data) == "table" and type(farmMap.data.cells) == "table"
@@ -316,7 +516,8 @@ for farmKey, farmMap in pairs(controllerState.farmMaps) do
         end
     end
 end
-if farmMapsTrimmedAtBoot or storageChanged then saveState() end
+local spatialStorageChanged = spatialStorage.migrateLegacy()
+if farmMapsTrimmedAtBoot or storageChanged or spatialStorageChanged then saveState() end
 
 local actionableStatuses = {
     NEEDS_FUEL = true,
@@ -868,6 +1069,9 @@ end
 
 local function expireTurtleLeases()
     local now = os.epoch("utc")
+    for reservationId, reservation in pairs(routeReservations) do
+        if reservation.expiresAt <= now then routeReservations[reservationId] = nil end
+    end
     for _, turtleInfo in pairs(controllerState.turtles) do
         if turtleInfo.online ~= false and (not turtleInfo.lastSeen or now - turtleInfo.lastSeen > 45000) then
             turtleInfo.online = false
@@ -1200,6 +1404,40 @@ local function handleWorker(sender, message)
                 controllerState.farmMaps[farmKey].data.cells = nil
             end
         end
+        if message.type == "FARM_3D_MAP" then
+            local spatialValue = payload
+            if type(spatialValue) ~= "table" or type(spatialValue.farmId) ~= "string"
+                or type(spatialValue.chunks) ~= "table" or spatialValue.version ~= 2
+                or type(spatialValue.origin) ~= "table"
+                or type(spatialValue.origin.x) ~= "number" or type(spatialValue.origin.y) ~= "number"
+                or type(spatialValue.origin.z) ~= "number" or type(spatialValue.radius) ~= "number" then
+                printError("Invalid 3D terrain report; it was not acknowledged")
+                return
+            end
+            for chunkKey, cells in pairs(spatialValue.chunks) do
+                local savedSpatial, spatialError = spatialStorage.write({
+                    farmId = spatialValue.farmId,
+                    chunkKey = chunkKey,
+                    revision = spatialValue.revision,
+                    verifiedAt = spatialValue.verifiedAt,
+                    changeCount = spatialValue.changeCount,
+                    surveyVersion = spatialValue.version,
+                    surveyOrigin = spatialValue.origin,
+                    surveyRadius = spatialValue.radius,
+                    cells = cells,
+                })
+                if not savedSpatial then
+                    printError(("3D terrain report was not acknowledged: %s"):format(tostring(spatialError)))
+                    return
+                end
+            end
+            for relayId in pairs(activeRelays) do
+                rednet.send(relayId, {
+                    type = "FARM_3D_CHANGED", farmId = spatialValue.farmId,
+                    revision = spatialValue.revision, controllerBootId = BOOT_ID,
+                }, JOB_PROTOCOL)
+            end
+        end
         if actionableStatuses[message.status] or message.type == "JOB_FAILED" then
             turtleInfo.statusDetail = payload.reason
                 or type(payload.result) == "string" and payload.result or turtleInfo.statusDetail
@@ -1276,11 +1514,14 @@ local function handleWorker(sender, message)
         local lastError = payload and payload.lastError
         local detail = payload and (payload.reason or payload.result
             or type(lastError) == "table" and (lastError.message or lastError.code))
-        print(("%s: %s%s"):format(
-            workerName,
-            message.type,
-            type(detail) == "string" and (" - " .. detail) or ""
-        ))
+        local routineTerrainReport = message.type == "FARM_MAP" or message.type == "FARM_3D_MAP"
+        if not routineTerrainReport then
+            print(("%s: %s%s"):format(
+                workerName,
+                message.type,
+                type(detail) == "string" and (" - " .. detail) or ""
+            ))
+        end
         if message.type == "JOB_FAILED" or message.type == "JOB_REJECTED"
             or (message.type == "WORKER_STATUS" and (actionableStatuses[message.status] or lastError)) then
             sendWorkerAlert(
@@ -1376,7 +1617,7 @@ while true do
         announceTimer = os.startTimer(15)
     elseif event == "timer" and first == playerTimer then
         pollTrackedPlayer()
-        playerTimer = os.startTimer(0.5)
+        playerTimer = os.startTimer(0.2)
     elseif event == "rednet_message" and third == JOB_PROTOCOL then
         if type(second) == "table" and second.type == "CONTROLLER_QUERY" then
             controllerHello(first)
@@ -1423,8 +1664,19 @@ while true do
             handleRemoteCommand(first, second)
         elseif type(second) == "table" and second.type == "FARM_ROUTE_REQUEST" then
             handleFarmRouteRequest(first, second)
+        elseif type(second) == "table" and second.type == "ROUTE_REQUEST" then
+            handleFarmRouteRequest(first, second)
+        elseif type(second) == "table"
+            and (second.type == "ROUTE_RELEASE" or second.type == "ROUTE_BLOCKED") then
+            handleRouteControl(first, second)
         elseif type(second) == "table" and second.type == "FARM_TERRAIN_REQUEST" then
             handleFarmTerrainRequest(first, second)
+        elseif type(second) == "table" and second.type == "FARM_3D_CHUNK_REQUEST" then
+            handleFarmSpatialRequest(first, second)
+        elseif type(second) == "table" and second.type == "FARM_3D_SURVEY_PLAN_REQUEST" then
+            handleFarmSurveyPlanRequest(first, second)
+        elseif type(second) == "table" and second.type == "FARM_3D_SLICE_REQUEST" then
+            handleRelaySpatialSliceRequest(first, second)
         else
             handleWorker(first, second)
         end

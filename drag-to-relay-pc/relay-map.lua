@@ -15,15 +15,29 @@ if not openModem() then error("Relay map requires a modem", 0) end
 
 local controllerId, controllerBootId, registered
 local farmMaps, snapshots, deltas, turtles = {}, {}, {}, {}
+local turtlePositionCandidates = {}
 local playerPosition
 local center = { x = 0, z = 0 }
 local centerInitialized = false
 local zoom, followPlayer = 1, true
+local caveCells, caveLayer, caveMode, cavePending = {}, nil, "auto", nil
+local caveEnvironment, caveSliceReady = "unknown", false
+local lastSliceRequest = 0
 local status = "Finding controller"
 local viewHeading = "north"
+local viewAngle = 0
 local previousGpsPosition
 local playerHeadingAt
+local headingFromYaw
+local gpsCandidate
+local gpsCandidateCount = 0
+local gpsLastSample
+local gpsLastDelta = { x = 0, z = 0 }
+local selectedTurtleId
+local lastRenderAt
 local playerDetector = peripheral.find("playerDetector") or peripheral.find("player_detector")
+
+local function blockCoordinate(value) return math.floor(value + 0.5) end
 
 local function finiteNumber(value)
     return type(value) == "number" and value == value
@@ -31,26 +45,46 @@ local function finiteNumber(value)
 end
 
 local function viewDelta(dx, dz)
-    if viewHeading == "east" then return dz, -dx end
-    if viewHeading == "south" then return -dx, -dz end
-    if viewHeading == "west" then return -dz, dx end
-    return dx, dz
+    local radians = viewAngle * math.pi / 180
+    local cosine, sine = math.cos(radians), math.sin(radians)
+    return dx * cosine + dz * sine, -dx * sine + dz * cosine
 end
 
 local function worldDelta(screenX, screenY)
-    if viewHeading == "east" then return -screenY, screenX end
-    if viewHeading == "south" then return -screenX, -screenY end
-    if viewHeading == "west" then return screenY, -screenX end
-    return screenX, screenY
+    local radians = viewAngle * math.pi / 180
+    local cosine, sine = math.cos(radians), math.sin(radians)
+    return screenX * cosine - screenY * sine, screenX * sine + screenY * cosine
+end
+
+local function acceptPlayerPosition(x, y, z)
+    x, y, z = blockCoordinate(x), blockCoordinate(y), blockCoordinate(z)
+    local dx, dz = gpsLastSample and x - gpsLastSample.x or 0, gpsLastSample and z - gpsLastSample.z or 0
+    local consistentMotion = dx * gpsLastDelta.x + dz * gpsLastDelta.z > 0
+    gpsLastSample, gpsLastDelta = { x = x, y = y, z = z }, { x = dx, z = dz }
+    if playerPosition and (x ~= playerPosition.x or y ~= playerPosition.y or z ~= playerPosition.z) then
+        if consistentMotion and gpsCandidate then
+            gpsCandidate, gpsCandidateCount = nil, 0
+            return x, y, z
+        end
+        if gpsCandidate and gpsCandidate.x == x and gpsCandidate.y == y and gpsCandidate.z == z then
+            gpsCandidateCount = gpsCandidateCount + 1
+        else
+            gpsCandidate, gpsCandidateCount = { x = x, y = y, z = z }, 1
+        end
+        if gpsCandidateCount < 3 then return nil end
+    end
+    gpsCandidate, gpsCandidateCount = nil, 0
+    return x, y, z
 end
 
 local function updatePlayerGps(x, y, z)
+    x, y, z = acceptPlayerPosition(x, y, z)
+    if not x then return end
     local now = os.epoch("utc")
     if previousGpsPosition and (not playerHeadingAt or now - playerHeadingAt > 1500) then
         local dx, dz = x - previousGpsPosition.x, z - previousGpsPosition.z
         if math.abs(dx) >= 0.5 or math.abs(dz) >= 0.5 then
-            if math.abs(dx) >= math.abs(dz) then viewHeading = dx >= 0 and "east" or "west"
-            else viewHeading = dz >= 0 and "south" or "north" end
+            headingFromYaw(math.deg(math.atan(-dx, dz)))
         end
     end
     previousGpsPosition = { x = x, z = z }
@@ -58,12 +92,12 @@ local function updatePlayerGps(x, y, z)
     centerInitialized = true
 end
 
-local function headingFromYaw(yaw)
+headingFromYaw = function(yaw)
     yaw = yaw % 360
-    if yaw < 45 or yaw >= 315 then return "south" end
-    if yaw < 135 then return "west" end
-    if yaw < 225 then return "north" end
-    return "east"
+    local step = math.floor(yaw / 45 + 0.5) % 8
+    local names = { "south", "southwest", "west", "northwest", "north", "northeast", "east", "southeast" }
+    viewAngle = (180 + step * 45) % 360
+    return names[step + 1]
 end
 
 local function pollPlayerHeading()
@@ -108,8 +142,14 @@ local function applyControllerPlayer(player)
     end
     if type(player) ~= "table" or not finiteNumber(player.x) or not finiteNumber(player.y)
         or not finiteNumber(player.z) or not finiteNumber(player.yaw) then return false end
-    playerPosition = { x = player.x, y = player.y, z = player.z }
-    previousGpsPosition = { x = player.x, z = player.z }
+    local x, y, z = acceptPlayerPosition(player.x, player.y, player.z)
+    if not x then
+        viewHeading = headingFromYaw(player.yaw)
+        playerHeadingAt = os.epoch("utc")
+        return true
+    end
+    playerPosition = { x = x, y = y, z = z }
+    previousGpsPosition = { x = x, z = z }
     viewHeading = headingFromYaw(player.yaw)
     playerHeadingAt = os.epoch("utc")
     centerInitialized = true
@@ -148,6 +188,26 @@ local function copyMetadata(metadata)
     return result
 end
 
+local function stableTurtlePosition(turtleId, position)
+    position = {
+        x = blockCoordinate(position.x), y = blockCoordinate(position.y), z = blockCoordinate(position.z),
+    }
+    local previous = turtles[turtleId] and turtles[turtleId].position
+    local candidate = turtlePositionCandidates[turtleId]
+    if previous then
+        if candidate and candidate.x == position.x and candidate.y == position.y
+            and candidate.z == position.z then
+            candidate.count = candidate.count + 1
+        else
+            candidate = { x = position.x, y = position.y, z = position.z, count = 1 }
+            turtlePositionCandidates[turtleId] = candidate
+        end
+        if candidate.count < 3 then return previous end
+    end
+    turtlePositionCandidates[turtleId] = nil
+    return { x = position.x, y = position.y, z = position.z }
+end
+
 local function copyTurtles(source)
     local result, count = {}, 0
     for id, turtleInfo in pairs(type(source) == "table" and source or {}) do
@@ -166,15 +226,17 @@ local function copyTurtles(source)
                 lastSeen = finiteNumber(turtleInfo.lastSeen) and turtleInfo.lastSeen or nil,
                 online = type(turtleInfo.online) == "boolean" and turtleInfo.online or nil,
                 release = type(turtleInfo.release) == "string" and turtleInfo.release:sub(1, 128) or nil,
-                position = {
-                    x = turtleInfo.position.x, y = turtleInfo.position.y, z = turtleInfo.position.z,
-                },
+                position = stableTurtlePosition(turtleId, turtleInfo.position),
             }
                 count = count + 1
             end
         end
     end
     return result
+end
+
+local function mergeTurtles(source)
+    for id, turtleInfo in pairs(copyTurtles(source)) do turtles[id] = turtleInfo end
 end
 
 local function prunePending(collection, maximum)
@@ -204,6 +266,19 @@ local function cellCount(exceptKey)
 end
 
 local function terrainColor(cell)
+    if cell.class == "tunnel" then
+        if cell.name and cell.name:find("water", 1, true) then return colors.blue end
+        if cell.name and cell.name:find("lava", 1, true) then return colors.red end
+        if cell.name and cell.name:find("deepslate", 1, true) then return colors.gray end
+        if cell.name and cell.name:find("stone", 1, true) then return colors.lightGray end
+        return colors.brown
+    end
+    if cell.class == "wall" or cell.class == "ceiling" then
+        if cell.name and cell.name:find("deepslate", 1, true) then return colors.gray end
+        if cell.name and cell.name:find("stone", 1, true) then return colors.lightGray end
+        return cell.class == "ceiling" and colors.gray or colors.lightGray
+    end
+    if cell.class == "pit" then return colors.red end
     if cell.occupant then
         if cell.occupant:find("leaves", 1, true) or cell.occupant:find("log", 1, true) then
             return colors.green
@@ -311,8 +386,35 @@ local function chooseCenter()
     end
 end
 
+local function focusNextTurtle()
+    local candidates = {}
+    local focus = playerPosition or { x = center.x, z = center.z }
+    for _, turtleInfo in pairs(turtles) do
+        if turtleInfo.position then
+            candidates[#candidates + 1] = turtleInfo
+        end
+    end
+    table.sort(candidates, function(a, b)
+        local ad = (a.position.x - focus.x) ^ 2 + (a.position.z - focus.z) ^ 2
+        local bd = (b.position.x - focus.x) ^ 2 + (b.position.z - focus.z) ^ 2
+        return ad == bd and tostring(a.id) < tostring(b.id) or ad < bd
+    end)
+    if #candidates == 0 then return end
+    local nextIndex = 1
+    for index, turtleInfo in ipairs(candidates) do
+        if turtleInfo.id == selectedTurtleId then nextIndex = index % #candidates + 1 break end
+    end
+    local turtleInfo = candidates[nextIndex]
+    selectedTurtleId = turtleInfo.id
+    followPlayer, centerInitialized = false, true
+    center.x, center.z = turtleInfo.position.x, turtleInfo.position.z
+end
+
 local function render()
     local width, height = term.getSize()
+    local now = os.epoch("utc")
+    if lastRenderAt and now ~= lastRenderAt and now - lastRenderAt < 100 then return end
+    lastRenderAt = now
     local pixelWidth, pixelHeight = width * 2, (height - 1) * 3
     local canvas = {}
     for y = 1, pixelHeight do
@@ -324,35 +426,69 @@ local function render()
             canvas[y][x] = color
         end
     end
+
+    local function drawTerrainPixel(x, y, color)
+        drawPixel(x, y, color)
+        local radians = viewAngle * math.pi / 180
+        if math.abs(math.sin(radians)) > 0.3 and math.abs(math.cos(radians)) > 0.3 then
+            drawPixel(x - 1, y, color)
+            drawPixel(x + 1, y, color)
+            drawPixel(x, y - 1, color)
+            drawPixel(x, y + 1, color)
+        end
+    end
+
+    local function caveVisible()
+        for _, cell in pairs(caveCells) do
+            local viewX, viewY = viewDelta(cell.x - center.x, cell.z - center.z)
+            local x = math.floor(viewX / zoom + pixelWidth / 2 + 0.5)
+            local y = math.floor(viewY / zoom + pixelHeight / 2 + 0.5)
+            if x >= 1 and x <= pixelWidth and y >= 1 and y <= pixelHeight then return true end
+        end
+        return false
+    end
+    local function drawTurtle(x, y, turtleInfo, visible)
+        local markerColor = turtleInfo.lastSeen
+            and os.epoch("utc") - turtleInfo.lastSeen > 60000
+            and colors.lightGray or visible and colors.orange or colors.red
+        local selected = turtleInfo.id == selectedTurtleId
+        local blink = selected and math.floor(os.epoch("utc") / 250) % 2 == 0
+        for dx = -1, 1 do for dy = -1, 1 do drawPixel(x + dx, y + dy, colors.black) end end
+        drawPixel(x, y, blink and colors.white or markerColor)
+        if not visible or markerColor == colors.lightGray then return end
+        local directions = {
+            north = { 0, -1 }, east = { 1, 0 }, south = { 0, 1 }, west = { -1, 0 },
+        }
+        local direction = directions[turtleInfo.heading]
+        if direction then
+            local viewX, viewY = viewDelta(direction[1], direction[2])
+            local tipX = x + math.floor(viewX + 0.5)
+            local tipY = y + math.floor(viewY + 0.5)
+            if tipX ~= x or tipY ~= y then drawPixel(tipX, tipY, colors.yellow) end
+        end
+    end
     chooseCenter()
-    for _, farmMap in pairs(farmMaps) do
-        for _, cell in pairs(farmMap.data and farmMap.data.cells or {}) do
+    local showCave = caveSliceReady and caveVisible()
+        and (caveMode == "cave" or caveMode == "auto" and caveEnvironment == "cave")
+    if showCave then
+        for _, cell in pairs(caveCells) do
             local viewX, viewY = viewDelta(cell.x - center.x, cell.z - center.z)
             local x = math.floor(viewX / zoom + pixelWidth / 2 + 0.5)
             local y = math.floor(viewY / zoom + pixelHeight / 2 + 0.5)
             if x >= 1 and x <= pixelWidth and y >= 1 and y <= pixelHeight then
-                drawPixel(x, y, terrainColor(cell))
+                drawTerrainPixel(x, y, terrainColor(cell))
             end
         end
-    end
-    local nearestName, nearestDistance
-    for _, turtleInfo in pairs(turtles) do
-        local position = turtleInfo.position
-        if position then
-            local distance = math.floor(math.sqrt(
-                (position.x - center.x) ^ 2 + (position.z - center.z) ^ 2
-            ) + 0.5)
-            if not nearestDistance or distance < nearestDistance then
-                nearestName, nearestDistance = turtleInfo.name or ("T" .. tostring(turtleInfo.id)), distance
+    else
+        for _, farmMap in pairs(farmMaps) do
+            for _, cell in pairs(farmMap.data and farmMap.data.cells or {}) do
+                local viewX, viewY = viewDelta(cell.x - center.x, cell.z - center.z)
+                local x = math.floor(viewX / zoom + pixelWidth / 2 + 0.5)
+                local y = math.floor(viewY / zoom + pixelHeight / 2 + 0.5)
+                if x >= 1 and x <= pixelWidth and y >= 1 and y <= pixelHeight then
+                    drawTerrainPixel(x, y, terrainColor(cell))
+                end
             end
-            local viewX, viewY = viewDelta(position.x - center.x, position.z - center.z)
-            local rawX = math.floor(viewX / zoom + pixelWidth / 2 + 0.5)
-            local rawY = math.floor(viewY / zoom + pixelHeight / 2 + 0.5)
-            local onScreen = rawX >= 1 and rawX <= pixelWidth and rawY >= 1 and rawY <= pixelHeight
-            local x = math.max(1, math.min(pixelWidth, rawX))
-            local y = math.max(1, math.min(pixelHeight, rawY))
-            local stale = turtleInfo.lastSeen and os.epoch("utc") - turtleInfo.lastSeen > 60000
-            drawPixel(x, y, stale and colors.lightGray or onScreen and colors.orange or colors.red)
         end
     end
     if playerPosition then
@@ -363,19 +499,97 @@ local function render()
             drawPixel(x, y, colors.cyan)
         end
     end
+    local nearestName, nearestDistance, selectedName, selectedHeight
+    for _, turtleInfo in pairs(turtles) do
+        local position = turtleInfo.position
+        if position then
+            local distance = math.floor(math.sqrt(
+                (position.x - center.x) ^ 2 + (position.z - center.z) ^ 2
+            ) + 0.5)
+            if not nearestDistance or distance < nearestDistance then
+                nearestName, nearestDistance = turtleInfo.name or ("T" .. tostring(turtleInfo.id)), distance
+            end
+            if turtleInfo.id == selectedTurtleId then
+                selectedName, selectedHeight = turtleInfo.name or ("T" .. tostring(turtleInfo.id)),
+                    math.floor(position.y)
+            end
+            local viewX, viewY = viewDelta(position.x - center.x, position.z - center.z)
+            local rawX = math.floor(viewX / zoom + pixelWidth / 2 + 0.5)
+            local rawY = math.floor(viewY / zoom + pixelHeight / 2 + 0.5)
+            local onScreen = rawX >= 1 and rawX <= pixelWidth and rawY >= 1 and rawY <= pixelHeight
+            local x = math.max(1, math.min(pixelWidth, rawX))
+            local y = math.max(1, math.min(pixelHeight, rawY))
+            drawTurtle(x, y, turtleInfo, onScreen)
+        end
+    end
     renderCanvas(canvas, pixelWidth, pixelHeight)
     local mode = followPlayer and (playerPosition and "GPS" or "AUTO") or "PAN"
-    local footer = ("%s z%d UP:%s %d,%d"):format(
-        mode, zoom, viewHeading:sub(1, 1):upper(),
+    local footer = ("%s z%d M:%s P:%s Y:%s UP:%s %d,%d"):format(
+        mode, zoom, caveMode:sub(1, 1):upper(),
+        playerPosition and math.floor(playerPosition.y) or "?", tostring(caveLayer or "?"),
+        viewHeading:sub(1, 1):upper(),
         math.floor(center.x), math.floor(center.z)
     )
-    if nearestName then footer = footer .. (" %s:%d"):format(nearestName, nearestDistance) end
+    if selectedName then footer = footer .. (" T:%s Y:%d"):format(selectedName, selectedHeight)
+    elseif nearestName then footer = footer .. (" %s:%d"):format(nearestName, nearestDistance) end
     if #footer < width then footer = footer .. " " .. status end
     term.setCursorPos(1, height)
     term.setBackgroundColor(colors.gray)
     term.setTextColor(colors.white)
     term.clearLine()
     term.write(footer:sub(1, width))
+end
+
+local function selectedFarmKey()
+    for farmKey in pairs(farmMaps) do return farmKey end
+end
+
+local function defaultLayer()
+    if playerPosition then return math.floor(playerPosition.y) end
+    for _, turtleInfo in pairs(turtles) do
+        if turtleInfo.position then return math.floor(turtleInfo.position.y) end
+    end
+    for _, farmMap in pairs(farmMaps) do
+        if farmMap.data and farmMap.data.center then return math.floor(farmMap.data.center.y) end
+    end
+    return 0
+end
+
+local function requestSpatialSlice(force)
+    if not registered or not controllerId then return end
+    local farmKey = selectedFarmKey()
+    if not farmKey then return end
+    if caveMode == "auto" or caveLayer == nil then caveLayer = defaultLayer() end
+    local now = os.epoch("utc")
+    if not force and now - lastSliceRequest < 2000 then return end
+    lastSliceRequest = now
+    local width, height = term.getSize()
+    local radius = math.max(8, math.min(64, math.ceil(math.max(width * 2, height * 3) * zoom / 2)))
+    local requestId = ("slice-%d-%d"):format(os.getComputerID(), now)
+    cavePending = { id = requestId, chunks = {}, createdAt = now }
+    rednet.send(controllerId, {
+        type = "FARM_3D_SLICE_REQUEST", requestId = requestId, farmId = farmKey,
+        x = math.floor(center.x), y = caveLayer, z = math.floor(center.z), radius = radius,
+        source = os.getComputerID(), controllerBootId = controllerBootId,
+    }, JOB_PROTOCOL)
+end
+
+local function finishSpatialSlice(message)
+    if not cavePending or message.requestId ~= cavePending.id then return end
+    local cells, count = {}, 0
+    for index = 1, cavePending.chunkCount or 0 do
+        if not cavePending.chunks[index] then return end
+        for _, cell in ipairs(cavePending.chunks[index]) do
+            cells[("%d:%d"):format(cell.x, cell.z)] = cell
+            count = count + 1
+        end
+    end
+    if count == cavePending.cellCount then
+        caveCells = cells
+        caveSliceReady = true
+        status = ("3D layer Y%d"):format(caveLayer)
+    end
+    cavePending = nil
 end
 
 local function requestSnapshot(farmKey)
@@ -433,6 +647,7 @@ local function finishSnapshot(message)
     }
     snapshots[message.farmKey] = nil
     status = "Map synced"
+    requestSpatialSlice(true)
 end
 
 local function applyDelta(message)
@@ -483,8 +698,8 @@ local function handleController(sender, message)
         and (not controllerId or controllerId == sender) then
         local changed = controllerBootId ~= message.bootId
         controllerId, controllerBootId = sender, message.bootId
-        if changed then farmMaps, snapshots, deltas, registered = {}, {}, {}, false end
-        if type(message.turtleStates) == "table" then turtles = copyTurtles(message.turtleStates) end
+        if changed then farmMaps, snapshots, deltas, turtles, registered = {}, {}, {}, {}, false end
+        if type(message.turtleStates) == "table" then mergeTurtles(message.turtleStates) end
         if message.player ~= nil then applyControllerPlayer(message.player) end
         if not registered then
             rednet.send(sender, {
@@ -496,7 +711,7 @@ local function handleController(sender, message)
     elseif message.type == "RELAY_ACK" and sender == controllerId
         and message.controllerBootId == controllerBootId then
         registered = true
-        if type(message.turtleStates) == "table" then turtles = copyTurtles(message.turtleStates) end
+        if type(message.turtleStates) == "table" then mergeTurtles(message.turtleStates) end
         if message.player ~= nil then applyControllerPlayer(message.player) end
         applyIndex(message.farmMapKeys)
     elseif message.type == "PLAYER_UPDATE" and sender == controllerId
@@ -507,6 +722,10 @@ local function handleController(sender, message)
         and message.turtle.id then
         local copied = copyTurtles({ [message.turtle.id] = message.turtle })
         if copied[message.turtle.id] then turtles[message.turtle.id] = copied[message.turtle.id] end
+    elseif message.type == "FARM_3D_CHANGED" and sender == controllerId
+        and message.controllerBootId == controllerBootId then
+        caveSliceReady, cavePending = false, nil
+        requestSpatialSlice(false)
     elseif message.type == "FARM_MAP_SNAPSHOT_BEGIN" and sender == controllerId
         and message.controllerBootId == controllerBootId then
         local count = tonumber(message.cellCount)
@@ -541,6 +760,32 @@ local function handleController(sender, message)
     elseif message.type == "FARM_MAP_DELTA" and sender == controllerId
         and message.controllerBootId == controllerBootId then
         applyDelta(message)
+    elseif message.type == "FARM_3D_SLICE_BEGIN" and sender == controllerId
+        and message.controllerBootId == controllerBootId and cavePending
+        and message.requestId == cavePending.id and type(message.chunkCount) == "number"
+        and message.chunkCount >= 1 and message.chunkCount <= 256
+        and type(message.cellCount) == "number" and message.cellCount >= 0
+        and message.cellCount <= 13000 then
+        caveLayer = message.y
+        if message.environment == "surface" or message.environment == "cave" then
+            caveEnvironment = message.environment
+        end
+        cavePending.chunkCount, cavePending.cellCount = message.chunkCount, message.cellCount
+    elseif message.type == "FARM_3D_SLICE_CHUNK" and sender == controllerId
+        and message.controllerBootId == controllerBootId and cavePending
+        and message.requestId == cavePending.id and message.chunkCount == cavePending.chunkCount
+        and type(message.chunkIndex) == "number" and message.chunkIndex >= 1
+        and message.chunkIndex <= cavePending.chunkCount and type(message.cells) == "table"
+        and #message.cells <= 64 then
+        local chunk = {}
+        for _, cell in ipairs(message.cells) do
+            local copied = copyCell(cell)
+            if copied then chunk[#chunk + 1] = copied end
+        end
+        cavePending.chunks[message.chunkIndex] = chunk
+    elseif message.type == "FARM_3D_SLICE_END" and sender == controllerId
+        and message.controllerBootId == controllerBootId then
+        finishSpatialSlice(message)
     end
 end
 
@@ -569,7 +814,8 @@ while true do
             status = "GPS unavailable"
         end
         if pollPlayerHeading() then status = x and "GPS + yaw" or "Yaw detected" end
-        gpsTimer = os.startTimer(0.5)
+        requestSpatialSlice(false)
+        gpsTimer = os.startTimer(0.2)
     elseif event == "timer" and first == queryTimer then
         rednet.broadcast({ type = "CONTROLLER_QUERY", source = os.getComputerID() }, JOB_PROTOCOL)
         queryTimer = os.startTimer(10)
@@ -590,7 +836,7 @@ while true do
     elseif event == "key" and first == keys.pageUp then
         zoom = math.max(1, math.floor(zoom / 2))
     elseif event == "key" and first == keys.pageDown then
-        zoom = math.min(16, zoom * 2)
+        zoom = math.min(64, zoom * 2)
     elseif event == "key" and first == keys.space then
         followPlayer = true
         centerInitialized = false
@@ -598,12 +844,33 @@ while true do
     elseif event == "char" and (first == "+" or first == "=") then
         zoom = math.max(1, math.floor(zoom / 2))
     elseif event == "char" and first == "-" then
-        zoom = math.min(16, zoom * 2)
+        zoom = math.min(64, zoom * 2)
     elseif event == "char" and string.lower(first) == "f" then
         followPlayer = not followPlayer
+    elseif event == "char" and string.lower(first) == "t" then
+        focusNextTurtle()
+    elseif event == "char" and first == "[" then
+        caveMode, caveLayer = "cave", (caveLayer or defaultLayer()) - 1
+        requestSpatialSlice(true)
+    elseif event == "char" and first == "]" then
+        caveMode, caveLayer = "cave", (caveLayer or defaultLayer()) + 1
+        requestSpatialSlice(true)
+    elseif event == "char" and string.lower(first) == "l" then
+        caveMode, caveLayer = "auto", defaultLayer()
+        requestSpatialSlice(true)
+    elseif event == "char" and string.lower(first) == "a" then
+        caveMode, caveLayer = "auto", defaultLayer()
+        requestSpatialSlice(true)
+    elseif event == "char" and string.lower(first) == "s" then
+        caveMode = "surface"
+        caveSliceReady = false
+    elseif event == "char" and string.lower(first) == "c" then
+        caveMode, caveLayer = "cave", caveLayer or defaultLayer()
+        requestSpatialSlice(true)
     elseif event == "mouse_scroll" then
-        if first > 0 then zoom = math.min(16, zoom * 2)
+        if first > 0 then zoom = math.min(64, zoom * 2)
         else zoom = math.max(1, math.floor(zoom / 2)) end
     end
+    requestSpatialSlice(false)
     render()
 end

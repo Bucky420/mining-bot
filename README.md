@@ -110,9 +110,13 @@ known volume is missing or no terrain copy can be validated, the controller
 rejects the update instead of acknowledging data it could not preserve.
 
 `/data/controller.state` retains worker, job, revision, and stable volume
-metadata. Bulk farm maps use compact, atomic terrain files on the mounted
-computers. Removing a storage computer can therefore make its farms temporarily
-unavailable, but does not silently create a conflicting map on another volume.
+metadata. Both compact 2D farm maps and authoritative 3D chunks use separate,
+atomic terrain directories on the mounted computers. Legacy controller-local
+3D chunks are copied and validated on mounted storage before the index changes;
+the source is retained for rollback. Removing a storage computer can therefore
+make its farms temporarily unavailable, but does not silently create a
+conflicting map on another volume. The controller monitor header shows aggregate
+used percentage, connected/configured drive count, and used/total capacity.
 
 ## Turtle Commands
 
@@ -151,10 +155,21 @@ shows the corresponding world direction.
 - Arrow keys pan and disable player follow.
 - `Page Up` zooms in and `Page Down` zooms out.
 - Press `Space` to center on the player and restore following.
+- Press `T` to focus the next known turtle, ordered by distance from the player
+  (or current map center).
 - The native Pocket map uses CC:Tweaked 2-by-3 semigraphics for six square map
   pixels per terminal character.
-- Cyan pixels mark the player, orange pixels mark turtles, and red edge pixels
-  mark off-screen turtles.
+- Cyan pixels mark the player. Turtle markers use a black high-contrast outline;
+  the focused turtle blinks white/orange and its facing tip is yellow. Red
+  centers mark off-screen turtles.
+- The Pocket requests bounded cave slices from the controller's 3D chunks; it
+  does not copy or persist the turtle's complete navigation map.
+- `[` and `]` select a manual Y level. `L` toggles automatic mode, which follows
+  the player/turtle Y and switches back to the grass surface map when the known
+  column is open to the surface.
+- Cave layers show walkable two-block-high tunnels, walls, low ceilings, and
+  pits. Unknown cells remain blank, and the 2D surface map is the fallback until
+  3D data exists.
 - Click the native `Command` tab to return to commands.
 
 GPS reports movement but not stationary head direction. For live yaw, connect an
@@ -209,28 +224,52 @@ produce a small addition and larger supplies expand farther. When the envelope
 is full, available replacement seeds gradually rebalance active crops toward
 equal alternating rows.
 
-The service surveys terrain in Geo Scanner tiles, follows local ground contours
-within three blocks above or below the chest ground level, and publishes
-revisioned terrain deltas to the controller. Survey centers use an overlapping
-serpentine sweep with long straight rows and short L transitions. Obstacle
-routes penalize rotations, preferring one large L or a slightly longer path
-over repeated left-right turns. It preserves trees, excludes their
-occupied canopy cells, and applies a three-block construction and travel margin
-around fences, buildings, unknown blocks, and terrain outside the vertical
-limit. Fully enclosed natural sand or stone surface islands may be replaced
-with dirt. Fully enclosed holes no deeper than three blocks may be filled.
-Every destructive operation re-inspects the live block and checkpoints before
-changing it.
+The service surveys terrain in spherical Geo Scanner tiles, follows local
+ground contours within three blocks above or below the chest ground level, and
+publishes revisioned terrain deltas to the controller. Survey centers use an
+eight-block serpentine spacing with long straight rows. Before each survey move,
+the turtle asks the mining controller once for a distance-ordered array of
+missing current-version scan poses. The pose array and rolling 3D A* map remain
+in RAM. If the controller is unavailable, the turtle generates the complete
+local sweep once. If the next center is outside known air, it advances to the
+nearest reachable frontier, scans there, publishes the delta, and repeats. It
+may use a nearby scan cell when the nominal center is occupied. It preserves
+trees, excludes their occupied canopy cells, and applies a three-block
+construction and travel margin around fences, buildings, unknown blocks, and
+terrain outside the vertical limit. Fully enclosed natural sand or stone surface
+islands may be replaced with dirt. Fully enclosed holes no deeper than three
+blocks may be filled. Every destructive operation re-inspects the live block and
+checkpoints before changing it.
 
-The turtle persists only a rolling window of the four newest scanner tiles.
-Each tile is acknowledged only after the controller has validated its external
-copy. Long travel requests a turn-efficient route from the controller; every
-returned step is checked for integer coordinates, adjacency, destination, and
-length before movement. If the controller is unavailable, the turtle may use
-its local window or a bounded route through freshly inspected air, but it never
-guesses through an unobserved obstacle. The complete terrain map is fetched in
-validated chunks only when the farm plan is rebuilt, then discarded after the
-compact execution plan is created.
+The mining controller persists authoritative 3D terrain as atomic 16x16x16
+chunk files under `bucky/terrain-3d/` on mounted storage computers. Chunks
+include known air, solid blocks, verification time, and a change count. The
+turtle requests chunks only for job-local navigation and recovery, keeps a 3x3
+chunk window in RAM, and merges fresh Geo Scanner results without allowing an
+older controller snapshot to overwrite newer local observations. Stable chunks
+are reused for up to 24 hours, while chunks with observed changes are refreshed
+after 15 minutes when approached. Ordinary crop work still updates inspected
+cells individually instead of triggering whole-farm scans.
+
+Survey coverage is versioned separately from stored terrain. Legacy 2D maps and
+older 3D chunks remain available for surface display and rollback, but they do
+not satisfy a current-version survey plan. Scan payloads and survey pose arrays
+are never persisted in turtle worker state.
+
+The turtle persists only a rolling window of the four newest surface tiles. A
+surface tile is acknowledged only after the controller has validated its
+external copy. If the controller is unavailable, the turtle may use its local
+window, but it never guesses through an unobserved obstacle. Farm survey points
+can be rebuilt from fresh 3D chunks without scanning again; expired or missing
+areas are scanned and uploaded as new 3D chunk data.
+All turtle movement enters the shared navigation layer. The controller plans
+coarse and long-range 3D waypoint arrays from its global map, reserving route
+cells against other turtles and a safety volume around the tracked player. The
+turtle validates adjacency and reinspects each physical move. Unexpected blocks
+are reported to the controller, which updates the chunk and replans once.
+Farm-survey and other close work movements may use the bounded local 3D cache;
+ordinary farming remains inspection-driven rather than repeatedly rescanning.
+Reactive overflight is not the default route planner.
 
 Actually Additions worms are preferred for irrigation. One reserved worm center
 covers each usable 3x3 tile. The turtle clears flowers or tall grass from that
